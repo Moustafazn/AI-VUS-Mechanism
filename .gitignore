@@ -1,0 +1,72 @@
+# ──────────────────────────────────────────────────────────────
+# SpliceVarMech — .gitignore
+# ──────────────────────────────────────────────────────────────
+
+# ── Data files (large, not for version control) ──
+# Only ignore top-level data/ folder (not src/data/ which is source code)
+/data/
+*.xlsx
+*.csv
+*.tsv
+*.h5
+*.hdf5
+*.fa
+*.fa.gz
+*.fasta
+*.fasta.gz
+*.vcf
+*.vcf.gz
+*.gtf
+*.gtf.gz
+*.bam
+*.bed
+
+# ── Notebooks (checkpoints, outputs) ──
+notebooks/.ipynb_checkpoints/
+*.ipynb
+.ipynb_checkpoints/
+
+# ── IDE / Editor ──
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environment ──
+venv/
+.venv/
+env/
+.env
+
+# ── PyTorch / ML artifacts ──
+experiments/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+wandb/
+runs/
+lightning_logs/
+
+# ── OS files ──
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Temporary files ──
+*.tmp
+*.temp
+*.log
+*.bak
