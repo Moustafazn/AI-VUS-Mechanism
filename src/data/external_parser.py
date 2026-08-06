@@ -3,17 +3,12 @@ SpliceVarMech — External Dataset Parser
 
 Parses supplementary data from recent literature studies for:
   - Training data augmentation (Study 6: 341 splice variants)
-  - Evaluation/validation (Study 4: 326 variants with TESE outcomes)
   - Literature cross-validation
 
 Study 6: "Defects in mRNA splicing and implications for infertility"
   → 341 variants × 30 cols including SpliceAI, CADD, gnomAD, ClinVar
   → 152 splicing + 29 intronic + 158 exonic (94 missense, 10 synonymous)
 
-Study 4: "Genetic determinants of TESE outcomes"
-  → 326 variants × 37 cols with TESE outcome (199 neg, 127 pos)
-  → 89 genes, ACMG classification, pathogenicity scores
-  → TEX11: 4 entries, all TESE-negative (validates our clinical case)
 """
 
 from __future__ import annotations
@@ -143,129 +138,6 @@ def get_study6_splice_variants(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Study 4: TESE outcomes
-# ──────────────────────────────────────────────────────────────────────
-
-@dataclass
-class Study4Variant:
-    """A variant from Study 4 with TESE outcome."""
-    sample_id: str
-    gene: str
-    hgvs_c: str
-    hgvs_p: str
-    consequence: str
-    tese_outcome: str       # "Positive" or "Negative"
-    testis_histology: str
-    zygosity: str
-    acmg_class: str
-    cadd_phred: Optional[float] = None
-    revel: Optional[float] = None
-    location_hg38: str = ""
-
-
-def parse_study4(
-    filepath: Optional[Path] = None,
-    sheet: str = "ST4",
-) -> tuple[pd.DataFrame, list[Study4Variant]]:
-    """
-    Parse Study 4 supplementary table (variants with TESE outcomes).
-
-    Args:
-        sheet: "ST4" for all variants, "ST7" for LP/P only
-    """
-    if filepath is None:
-        filepath = EXTERNAL_DATA_DIR / "data:external:study4_tese_panel.xlsx"
-
-    if not filepath.exists():
-        raise FileNotFoundError(f"Study 4 data not found at {filepath}")
-
-    df = pd.read_excel(filepath, sheet_name=sheet, header=1)
-    df = df.dropna(how="all").reset_index(drop=True)
-
-    def safe_float_eu(val) -> Optional[float]:
-        """Convert to float, handling European commas and placeholders."""
-        if val is None or (isinstance(val, float) and np.isnan(val)):
-            return None
-        if isinstance(val, (int, float)):
-            return float(val)
-        s = str(val).strip()
-        if s in (".", "", "nan", "NA", "N/A", "-"):
-            return None
-        # Handle European decimal comma (e.g., "17,88" → 17.88)
-        s = s.replace(",", ".")
-        try:
-            return float(s)
-        except (ValueError, TypeError):
-            return None
-
-    variants = []
-    for _, row in df.iterrows():
-        gene = str(row.get("GENE_SYMBOL", "")).strip()
-        if not gene or gene == "nan":
-            gene = str(row.get("Gene", "")).strip()
-        if not gene or gene == "nan":
-            continue
-
-        tese = str(row.get("TESE", row.get("TESE outcome", ""))).strip()
-        hgvs_c = str(row.get("HGVSc", row.get("Variant (HGVSc)", ""))).strip()
-        hgvs_p = str(row.get("HGVSp", row.get("Variant (HGVSp)", ""))).strip()
-
-        v = Study4Variant(
-            sample_id=str(row.get("Sample_ID", row.get("Patient_ID", ""))),
-            gene=gene,
-            hgvs_c=hgvs_c,
-            hgvs_p=hgvs_p,
-            consequence=str(row.get("Consequence", "")),
-            tese_outcome=tese,
-            testis_histology=str(row.get("Testis Histology", row.get("Testicular phenotype reported ", ""))),
-            zygosity=str(row.get("Zygosity", "")),
-            acmg_class=str(row.get("ACMG_classification (diagnsotic)", row.get("ACMG_classification (adapted from Wyrwoll et al.)", ""))),
-            cadd_phred=safe_float_eu(row.get("CADD_PHRED")),
-            revel=safe_float_eu(row.get("REVEL")),
-            location_hg38=str(row.get("Location (hg38)", "")),
-        )
-        variants.append(v)
-
-    return df, variants
-
-
-def get_study4_tese_outcomes(
-    gene_filter: Optional[list[str]] = None,
-) -> dict:
-    """
-    Get TESE outcome statistics from Study 4.
-
-    Returns dict with per-gene TESE outcome counts and overall stats.
-    """
-    _, variants = parse_study4()
-
-    if gene_filter:
-        gene_set = set(g.upper() for g in gene_filter)
-        variants = [v for v in variants if v.gene.upper() in gene_set]
-
-    # Per-gene TESE outcomes
-    gene_outcomes: dict[str, dict[str, int]] = {}
-    for v in variants:
-        if v.gene not in gene_outcomes:
-            gene_outcomes[v.gene] = {"Positive": 0, "Negative": 0, "Unknown": 0}
-        outcome = v.tese_outcome if v.tese_outcome in ("Positive", "Negative") else "Unknown"
-        gene_outcomes[v.gene][outcome] += 1
-
-    # Overall stats
-    total = len(variants)
-    n_pos = sum(1 for v in variants if v.tese_outcome == "Positive")
-    n_neg = sum(1 for v in variants if v.tese_outcome == "Negative")
-
-    return {
-        "total_variants": total,
-        "tese_positive": n_pos,
-        "tese_negative": n_neg,
-        "unique_genes": len(gene_outcomes),
-        "gene_outcomes": gene_outcomes,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────
 # RBP Table 1 data (from Study 1 — hardcoded from paper table)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -363,26 +235,6 @@ def run_external_data_summary(verbose: bool = True) -> dict:
     except FileNotFoundError:
         if verbose:
             print("\n  Study 6: File not found (data/external/study6_splice_variants.xlsx)")
-
-    # Study 4
-    try:
-        df4, variants4 = parse_study4()
-        results["study4"] = get_study4_tese_outcomes()
-
-        if verbose:
-            print(f"\n  Study 4 — TESE outcomes:")
-            print(f"    Total variants: {results['study4']['total_variants']}")
-            print(f"    TESE positive: {results['study4']['tese_positive']}")
-            print(f"    TESE negative: {results['study4']['tese_negative']}")
-            print(f"    Unique genes: {results['study4']['unique_genes']}")
-
-            # TEX11 specific
-            tex11 = results["study4"]["gene_outcomes"].get("TEX11", {})
-            if tex11:
-                print(f"    TEX11: {tex11}")
-    except FileNotFoundError:
-        if verbose:
-            print("\n  Study 4: File not found")
 
     # RBP splice variants
     results["rbp_splice"] = {

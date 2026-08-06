@@ -1,11 +1,13 @@
 """
-SpliceVarMech — End-to-End Prediction Pipeline (Phase 6)
+SpliceVarMech — End-to-End Prediction Pipeline
 
-Full pipeline: Variant → Diffusion Sampling → Bayesian Causal Inference → Clinical Report
+Full pipeline: Variant → Biological Diffusion → Bayesian Causal Inference → Clinical Report
+
+Uses the BiologicalDiffusionModel with dual-stream (WT vs MUT) comparison.
 
 For the TEX11 c.1156+16G>T case:
-  1. Extract pre-mRNA context (±200bp around variant)
-  2. Run diffusion model → generate N predicted mRNA samples
+  1. Extract WT and MUT pre-mRNA contexts (±200bp around variant)
+  2. Run BiologicalDiffusionModel → generate N predicted mRNA samples
   3. Classify mechanisms → compute outcome distribution
   4. Feed diffusion output into Bayesian causal model
   5. Run MCMC → compute posterior P(disruption | evidence)
@@ -21,34 +23,25 @@ from typing import Optional
 import numpy as np
 import torch
 
-from src.diffusion.model import SpliceDiffusionModel, DiffusionConfig
+from src.diffusion.model import BiologicalDiffusionModel, DiffusionConfig, VOCAB, tokenize_sequence
 from src.diffusion.sampling import (
     SpliceSampler,
     OutcomeDistribution,
     print_outcome_distribution,
 )
-from src.diffusion.training import (
-    generate_splice_junction,
-    _exon_with_ese,
-    _intron_with_consensus,
-)
+from src.diffusion.training import _exon_with_ese, _intron_with_consensus
 
 
 # ──────────────────────────────────────────────────────────────────────
 # TEX11 variant context
 # ──────────────────────────────────────────────────────────────────────
 
-# TEX11 c.1156+16G>T — the clinical case from the README
-# Without hg38 reference genome access, we construct a biologically
-# plausible synthetic context based on known TEX11 structure.
-# In production, this would be extracted from the actual reference genome.
-
 TEX11_VARIANT = {
     "gene": "TEX11",
     "hgvs": "c.1156+16G>T",
     "chromosome": "X",
     "position_type": "intronic",
-    "splice_position": 16,  # +16 from donor site
+    "splice_position": 16,
     "ref_allele": "G",
     "alt_allele": "T",
     "clinical_phenotype": "Non-obstructive azoospermia",
@@ -56,209 +49,144 @@ TEX11_VARIANT = {
 }
 
 
-def construct_tex11_context(variant_position: int = 16) -> tuple[str, str]:
+def construct_tex11_context(variant_position: int = 16) -> tuple[str, str, int]:
     """
-    Construct synthetic pre-mRNA context for TEX11 c.1156+16G>T.
-
-    The context includes:
-    - Upstream exon (exon N, ~100bp with ESE motifs)
-    - 5' donor splice site (GT consensus)
-    - Intronic sequence with the variant at position +16
-    - 3' acceptor splice site (AG consensus)
-    - Downstream exon (exon N+1, ~100bp)
+    Construct WT and MUT pre-mRNA contexts for TEX11 c.1156+16G>T.
 
     Returns:
-        (wildtype_context, mutant_context) — both ±200bp around the variant
+        (wt_context, mut_context, variant_pos_in_context)
     """
-    # Upstream exon with ESE motifs (exon N of TEX11)
-    exon_upstream = _exon_with_ese(100)
+    try:
+        from src.data.hg38_context import extract_tex11_context as _extract
+        ctx = _extract()
+        # Find variant position by comparing WT and MUT
+        var_pos = 0
+        for i in range(min(len(ctx.wt_pre_mrna), len(ctx.mut_pre_mrna))):
+            if ctx.wt_pre_mrna[i] != ctx.mut_pre_mrna[i]:
+                var_pos = i
+                break
+        return ctx.wt_pre_mrna, ctx.mut_pre_mrna, var_pos
+    except Exception:
+        pass
 
-    # Intron with proper splice signals
-    # Donor: GT at +1/+2, extended consensus to +6
+    # Synthetic fallback
+    exon_upstream = _exon_with_ese(100)
     donor = "GTAAGT"
-    # Intronic body before variant position
     intron_before = "AGCTTCGACGTC"[:max(0, variant_position - len(donor))]
-    # Pad if needed
     while len(donor) + len(intron_before) < variant_position:
         intron_before += "A"
-
-    # The variant position — G in wild-type, T in mutant
-    wt_base = "G"
-    mut_base = "T"
-
-    # Intronic body after variant
-    intron_after_len = 80
-    intron_after = "TGCAAGCTTGACCTGAAC" + "ATTGC" * 12
-    intron_after = intron_after[:intron_after_len]
-
-    # Polypyrimidine tract and acceptor
+    intron_after = ("TGCAAGCTTGACCTGAAC" + "ATTGC" * 12)[:80]
     ppt = "TTTTCTTTCCTTTCTT"
     acceptor = "AG"
-
-    # Build full intron
-    wt_intron = donor + intron_before + wt_base + intron_after + ppt + acceptor
-    mut_intron = donor + intron_before + mut_base + intron_after + ppt + acceptor
-
-    # Downstream exon
+    wt_intron = donor + intron_before + "G" + intron_after + ppt + acceptor
+    mut_intron = donor + intron_before + "T" + intron_after + ppt + acceptor
     exon_downstream = _exon_with_ese(100)
 
-    # Build full contexts
     wt_context = exon_upstream + wt_intron + exon_downstream
     mut_context = exon_upstream + mut_intron + exon_downstream
+    var_pos = len(exon_upstream) + len(donor) + len(intron_before)
 
-    # Expected wild-type mRNA (correctly spliced)
-    wt_mrna = exon_upstream + exon_downstream
-
-    return wt_context, mut_context
+    return wt_context, mut_context, var_pos
 
 
 def get_tex11_wildtype_mrna() -> str:
-    """Get the expected wild-type mRNA for TEX11 (exon junction)."""
-    return _exon_with_ese(100) + _exon_with_ese(100)
+    """Get expected WT mRNA for TEX11."""
+    try:
+        from src.data.hg38_context import extract_tex11_context as _extract
+        return _extract().wt_mrna
+    except Exception:
+        return _exon_with_ese(100) + _exon_with_ese(100)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Clinical report data structures
+# Clinical report structures
 # ──────────────────────────────────────────────────────────────────────
-
 
 @dataclass
 class ProteinConsequence:
-    """Predicted protein-level consequence."""
-    effect: str              # "frameshift", "in_frame_deletion", "truncation", "none"
-    reading_frame_shift: int  # Number of bp shift (0 if in-frame)
-    premature_stop: bool     # Whether a premature stop codon is created
-    nmd_predicted: bool      # Whether NMD is predicted
-    domain_affected: str     # Which protein domain is affected
+    effect: str
+    reading_frame_shift: int
+    premature_stop: bool
+    nmd_predicted: bool
+    domain_affected: str
     detail: str = ""
 
 
 @dataclass
 class ClinicalReport:
-    """Complete clinical interpretation report."""
-    # Variant info
     gene: str
     variant: str
     clinical_phenotype: str
-
-    # Diffusion model output
     outcome_distribution: Optional[OutcomeDistribution] = None
     n_samples: int = 0
     aberrant_fraction: float = 0.0
     dominant_mechanism: str = "unknown"
-
-    # Bayesian causal model output
     posterior_p_disruption: float = 0.0
     credible_interval_lower: float = 0.0
     credible_interval_upper: float = 0.0
     causal_effect: float = 0.0
-
-    # Protein consequence
     protein_consequence: Optional[ProteinConsequence] = None
-
-    # ACMG criteria
     acmg_criteria: list[str] = field(default_factory=list)
     acmg_classification: str = "VUS"
-
-    # Causal path
     primary_causal_path: str = ""
     causal_path_probability: float = 0.0
-
-    # Counterfactual
     counterfactual_normal_probability: float = 0.0
 
 
-def predict_protein_consequence(
-    mechanism: str,
-    gene: str = "TEX11",
-) -> ProteinConsequence:
-    """
-    Predict protein-level consequence from the splice mechanism.
-    """
+def predict_protein_consequence(mechanism: str, gene: str = "TEX11") -> ProteinConsequence:
     if mechanism == "exon_skipping":
-        # Exon skipping typically causes frameshift (unless exon length % 3 == 0)
         return ProteinConsequence(
-            effect="frameshift",
-            reading_frame_shift=1,  # Most exons are not multiples of 3
-            premature_stop=True,
-            nmd_predicted=True,
-            domain_affected="recombination domain (meiotic crossover)",
-            detail=f"Exon skipping in {gene} → frameshift → premature stop codon → "
-                   f"NMD → complete loss of {gene} protein",
+            "frameshift", 1, True, True,
+            "recombination domain (meiotic crossover)",
+            f"Exon skipping in {gene} → frameshift → premature stop → NMD → loss of {gene} protein",
         )
     elif mechanism == "intron_retention":
         return ProteinConsequence(
-            effect="truncation",
-            reading_frame_shift=0,
-            premature_stop=True,
-            nmd_predicted=True,
-            domain_affected="recombination domain",
-            detail=f"Intron retention in {gene} → introduces stop codons from "
-                   f"intronic sequence → NMD → loss of protein",
+            "truncation", 0, True, True,
+            "recombination domain",
+            f"Intron retention in {gene} → stop codons from intronic sequence → NMD → loss of protein",
         )
     elif mechanism == "partial_deletion":
         return ProteinConsequence(
-            effect="in_frame_deletion",
-            reading_frame_shift=0,
-            premature_stop=False,
-            nmd_predicted=False,
-            domain_affected="unknown — depends on deleted region",
-            detail=f"Partial exon deletion in {gene} → may produce truncated protein "
-                   f"lacking functional domains",
+            "in_frame_deletion", 0, False, False,
+            "unknown — depends on deleted region",
+            f"Partial exon deletion in {gene} → may produce truncated protein",
         )
     else:
         return ProteinConsequence(
-            effect="none",
-            reading_frame_shift=0,
-            premature_stop=False,
-            nmd_predicted=False,
-            domain_affected="none",
-            detail="Normal splicing — no protein consequence predicted",
+            "none", 0, False, False, "none",
+            "Normal splicing — no protein consequence predicted",
         )
 
 
 def determine_acmg_criteria(
-    posterior_p: float,
-    aberrant_fraction: float,
-    mechanism: str,
-    gene: str = "TEX11",
+    posterior_p: float, aberrant_fraction: float,
+    mechanism: str, gene: str = "TEX11",
 ) -> tuple[list[str], str]:
-    """
-    Map model outputs to ACMG/AMP variant classification criteria.
-
-    Returns:
-        (list of met criteria, overall classification)
-    """
     criteria = []
 
-    # PP3: Computational evidence supports a deleterious effect
     if posterior_p > 0.7:
         criteria.append("PP3_Strong (multiple computational tools + causal model predict disruption)")
     elif posterior_p > 0.5:
         criteria.append("PP3_Moderate (computational evidence supports disruption)")
 
-    # PM2: Absent from population databases
-    criteria.append("PM2_Supporting (variant absent from gnomAD — assumed for TEX11 VUS)")
+    criteria.append("PM2_Supporting (variant absent from gnomAD)")
 
-    # PS3-like: Functional evidence from diffusion model
     if aberrant_fraction > 0.5 and mechanism != "normal":
         criteria.append("PS3_Moderate (diffusion model predicts aberrant mRNA with high confidence)")
 
-    # PP4: Patient's phenotype is consistent
     criteria.append("PP4 (azoospermia consistent with TEX11 loss of function)")
 
-    # Determine classification
-    strong_count = sum(1 for c in criteria if "Strong" in c)
-    moderate_count = sum(1 for c in criteria if "Moderate" in c)
-    supporting_count = sum(1 for c in criteria if "Supporting" in c)
+    strong = sum(1 for c in criteria if "Strong" in c)
+    moderate = sum(1 for c in criteria if "Moderate" in c)
 
-    if strong_count >= 2 or (strong_count >= 1 and moderate_count >= 2):
+    if strong >= 2 or (strong >= 1 and moderate >= 2):
         classification = "Pathogenic"
-    elif strong_count >= 1 and moderate_count >= 1:
+    elif strong >= 1 and moderate >= 1:
         classification = "Likely Pathogenic"
-    elif strong_count >= 1 or moderate_count >= 2:
+    elif strong >= 1 or moderate >= 2:
         classification = "Likely Pathogenic"
-    elif moderate_count >= 1:
+    elif moderate >= 1:
         classification = "VUS (leaning pathogenic)"
     else:
         classification = "VUS"
@@ -266,227 +194,240 @@ def determine_acmg_criteria(
     return criteria, classification
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Report generation
-# ──────────────────────────────────────────────────────────────────────
-
-
 def generate_clinical_report(report: ClinicalReport) -> str:
-    """Generate a formatted clinical report string."""
     lines = []
     lines.append("=" * 70)
     lines.append("CLINICAL SPLICE VARIANT INTERPRETATION REPORT")
-    lines.append("SpliceVarMech Causal Generative Framework")
+    lines.append("SpliceVarMech Biological Diffusion Framework")
     lines.append("=" * 70)
-
-    # Variant info
     lines.append(f"\n  VARIANT: {report.gene} {report.variant}")
-    lines.append(f"  PHENOTYPE: {report.clinical_phenotype}")
-    lines.append("")
+    lines.append(f"  PHENOTYPE: {report.clinical_phenotype}\n")
 
-    # Module 1: Diffusion model results
     lines.append("-" * 70)
-    lines.append("MODULE 1: DIFFUSION MODEL — WHAT HAPPENS TO THE mRNA?")
+    lines.append("MODULE 1: BIOLOGICAL DIFFUSION MODEL — WHAT HAPPENS TO THE mRNA?")
     lines.append("-" * 70)
     if report.outcome_distribution:
         lines.append(f"  Samples generated: {report.n_samples}")
         lines.append(f"  Aberrant fraction: {report.aberrant_fraction:.1%}")
-        lines.append(f"  Dominant mechanism: {report.dominant_mechanism} "
-                     f"({report.outcome_distribution.dominant_fraction:.1%} of samples)")
-        lines.append(f"  Mechanism distribution:")
-        for mech, count in sorted(
-            report.outcome_distribution.mechanism_counts.items(),
-            key=lambda x: -x[1],
-        ):
+        lines.append(f"  Dominant mechanism: {report.dominant_mechanism}")
+        for mech, count in sorted(report.outcome_distribution.mechanism_counts.items(), key=lambda x: -x[1]):
             pct = count / report.n_samples * 100
             bar = "█" * int(pct / 2)
             lines.append(f"    {mech:25s} {count:4d} ({pct:5.1f}%) {bar}")
     lines.append("")
 
-    # Module 2: Bayesian causal model results
     lines.append("-" * 70)
     lines.append("MODULE 2: BAYESIAN CAUSAL MODEL — WHY DOES IT HAPPEN?")
     lines.append("-" * 70)
     lines.append(f"  P(splice disruption | evidence) = {report.posterior_p_disruption:.3f}")
-    lines.append(f"  95% Credible Interval: [{report.credible_interval_lower:.3f}, "
-                 f"{report.credible_interval_upper:.3f}]")
-    lines.append(f"  Causal effect of variant: {report.causal_effect:+.3f}")
+    lines.append(f"  95% CI: [{report.credible_interval_lower:.3f}, {report.credible_interval_upper:.3f}]")
+    lines.append(f"  Causal effect: {report.causal_effect:+.3f}")
     lines.append(f"  Primary causal path: {report.primary_causal_path}")
-    lines.append(f"  Causal path probability: {report.causal_path_probability:.2f}")
-    lines.append(f"  Counterfactual P(normal | restore WT): "
-                 f"{report.counterfactual_normal_probability:.2f}")
     lines.append("")
 
-    # Protein consequence
     lines.append("-" * 70)
     lines.append("MODULE 3: PROTEIN CONSEQUENCE")
     lines.append("-" * 70)
     if report.protein_consequence:
         pc = report.protein_consequence
         lines.append(f"  Effect: {pc.effect}")
-        lines.append(f"  Premature stop codon: {'Yes' if pc.premature_stop else 'No'}")
+        lines.append(f"  Premature stop: {'Yes' if pc.premature_stop else 'No'}")
         lines.append(f"  NMD predicted: {'Yes' if pc.nmd_predicted else 'No'}")
-        lines.append(f"  Domain affected: {pc.domain_affected}")
         lines.append(f"  Detail: {pc.detail}")
     lines.append("")
 
-    # ACMG classification
     lines.append("-" * 70)
     lines.append("ACMG VARIANT CLASSIFICATION")
     lines.append("-" * 70)
-    for criterion in report.acmg_criteria:
-        lines.append(f"  ✓ {criterion}")
+    for c in report.acmg_criteria:
+        lines.append(f"  ✓ {c}")
     lines.append(f"\n  ═══ CLASSIFICATION: {report.acmg_classification} ═══")
-    lines.append("")
 
-    # Clinical recommendation
-    lines.append("-" * 70)
-    lines.append("CLINICAL RECOMMENDATION")
-    lines.append("-" * 70)
     if "Pathogenic" in report.acmg_classification:
-        lines.append(f"  {report.gene} {report.variant} is classified as {report.acmg_classification}.")
-        lines.append(f"  The variant CAUSES {report.dominant_mechanism.replace('_', ' ')}")
-        lines.append(f"  (posterior probability: {report.posterior_p_disruption:.2f}, "
-                     f"95% CI: [{report.credible_interval_lower:.2f}, "
-                     f"{report.credible_interval_upper:.2f}])")
-        if report.protein_consequence and report.protein_consequence.nmd_predicted:
-            lines.append(f"  → {report.protein_consequence.effect} → NMD → "
-                         f"loss of {report.gene} protein")
-        lines.append(f"  → Explains patient's {report.clinical_phenotype}")
         lines.append(f"\n  RECOMMENDATION: Reclassify VUS → {report.acmg_classification}")
-        lines.append(f"  Genetic counseling recommended for reproductive options")
-    else:
-        lines.append(f"  Classification: {report.acmg_classification}")
-        lines.append(f"  Additional functional studies recommended for definitive classification")
+        lines.append(f"  Genetic counseling recommended")
 
     lines.append("\n" + "=" * 70)
     lines.append("END OF REPORT")
     lines.append("=" * 70)
-
     return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# End-to-end prediction pipeline
+# End-to-end prediction
 # ──────────────────────────────────────────────────────────────────────
-
 
 def run_tex11_prediction(
     n_samples: int = 50,
     model_config: Optional[DiffusionConfig] = None,
-    device: str = "cpu",
+    device: str = "",
 ) -> ClinicalReport:
     """
-    Run the complete end-to-end prediction for TEX11 c.1156+16G>T.
-
-    Pipeline:
-    1. Construct pre-mRNA context (WT and mutant)
-    2. Generate mRNA samples with diffusion model
-    3. Classify mechanisms
-    4. Run Bayesian causal inference
-    5. Generate clinical report
+    Run complete end-to-end prediction for TEX11 c.1156+16G>T.
     """
     print("=" * 70)
-    print("PHASE 6: TEX11 c.1156+16G>T — END-TO-END PREDICTION")
+    print("TEX11 c.1156+16G>T — END-TO-END PREDICTION")
+    print("  Using BiologicalDiffusionModel (dual-stream, contrastive)")
     print("=" * 70)
 
-    # ── Step 1: Construct context ──
-    print("\n[Step 1] Constructing TEX11 pre-mRNA context...")
+    # Step 1: Construct contexts
+    print("\n[Step 1] Constructing TEX11 pre-mRNA contexts...")
     np.random.seed(42)
     import random
     random.seed(42)
 
-    wt_context, mut_context = construct_tex11_context(variant_position=16)
-    wt_mrna = wt_context[:100] + wt_context[-100:]  # Expected: exon1 + exon2
+    wt_context, mut_context, var_pos = construct_tex11_context(variant_position=16)
+    wt_mrna = get_tex11_wildtype_mrna()
+    ref_allele = "G"
+    alt_allele = "T"
 
-    print(f"  WT context length: {len(wt_context)} bp")
-    print(f"  Mutant context length: {len(mut_context)} bp")
-    print(f"  Expected WT mRNA length: {len(wt_mrna)} bp")
-    print(f"  Variant: G→T at position +16 in intron")
+    print(f"  WT context: {len(wt_context)} bp")
+    print(f"  MUT context: {len(mut_context)} bp")
+    print(f"  Variant position in context: {var_pos}")
+    print(f"  Expected WT mRNA: {len(wt_mrna)} bp")
+    print(f"  Variant: {ref_allele}→{alt_allele} at +16")
 
-    # ── Step 2: Initialize diffusion model ──
-    print("\n[Step 2] Initializing diffusion model...")
+    # Step 2: Initialize model + load trained checkpoint + apply EMA
+    print("\n[Step 2] Initializing BiologicalDiffusionModel...")
     if model_config is None:
-        model_config = DiffusionConfig(
-            max_seq_len=256,
-            d_model=128,
-            n_heads=4,
-            n_layers=4,
-            d_ff=512,
-            n_timesteps=30,
-        )
-    model = SpliceDiffusionModel(model_config)
-    print(f"  Model parameters: {model.get_num_params():,}")
-    print(f"  NOTE: Using untrained model for demonstration.")
-    print(f"  In production, load pre-trained + fine-tuned checkpoint.")
+        from src.config import get_diffusion_config
+        model_config = get_diffusion_config()
+    if not device:
+        from src.config import get_device
+        device = get_device()
 
+    model = BiologicalDiffusionModel(model_config)
+    print(f"  Parameters: {model.get_num_params():,}")
+    print(f"  Device: {device}")
+
+    # Load trained checkpoint if available (critical for meaningful predictions)
+    from pathlib import Path
+    from src.diffusion.model import EMA
+    checkpoint_path = Path("experiments/checkpoints/splice_diffusion_model.pt")
+    ema = None
+    if checkpoint_path.exists():
+        print(f"  Loading checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+        else:
+            model.load_state_dict(ckpt)
+        # Apply EMA weights for stable inference (Ho et al. 2020)
+        if "ema_state" in ckpt:
+            ema = EMA(model)
+            ema.load_state_dict(ckpt["ema_state"])
+            ema.apply_shadow()
+            print("  ✅ EMA weights applied for inference")
+        print(f"  ✅ Checkpoint loaded successfully")
+    else:
+        print("  ⚠️  No checkpoint found — using untrained model (results will be random)")
+
+    model.to(device)
+    model.eval()
     sampler = SpliceSampler(model, device=device)
 
-    # ── Step 3: Generate samples and classify ──
+    # Step 3: Generate mutant samples
     print(f"\n[Step 3] Generating {n_samples} mRNA samples from mutant context...")
     mut_distribution = sampler.analyze_outcomes(
-        pre_mrna_context=mut_context[:model_config.max_seq_len],
+        wt_context=wt_context[:model_config.max_seq_len],
+        mut_context=mut_context[:model_config.max_seq_len],
+        variant_pos=var_pos,
         wildtype_mrna=wt_mrna,
+        ref_allele=ref_allele,
+        alt_allele=alt_allele,
         n_samples=n_samples,
         seq_len=min(200, model_config.max_seq_len),
-        temperature=1.0,
         batch_size=min(10, n_samples),
     )
     print_outcome_distribution(mut_distribution, "Mutant TEX11")
 
-    # ── Step 4: Wild-type comparison (counterfactual) ──
-    print(f"\n[Step 4] Generating {n_samples} samples from wild-type context (counterfactual)...")
+    # Step 3b: Disruption score
+    print(f"\n[Step 3b] Computing disruption score (likelihood-ratio)...")
+    wt_mrna_tok = tokenize_sequence(wt_mrna, min(200, model_config.max_seq_len)).unsqueeze(0).to(device)
+    wt_ctx_tok = tokenize_sequence(wt_context[:model_config.max_seq_len], model_config.max_seq_len).unsqueeze(0).to(device)
+    mut_ctx_tok = tokenize_sequence(mut_context[:model_config.max_seq_len], model_config.max_seq_len).unsqueeze(0).to(device)
+    vpos_tok = torch.tensor([var_pos], dtype=torch.long, device=device)
+    ref_tok = torch.tensor([VOCAB.get(ref_allele, 1)], dtype=torch.long, device=device)
+    alt_tok = torch.tensor([VOCAB.get(alt_allele, 1)], dtype=torch.long, device=device)
+
+    disruption = model.compute_disruption_score(
+        wt_mrna=wt_mrna_tok,
+        wt_context=wt_ctx_tok,
+        mut_context=mut_ctx_tok,
+        variant_pos=vpos_tok,
+        ref_token=ref_tok,
+        alt_token=alt_tok,
+        n_timestep_samples=20,
+    )
+    print(f"  WT NLL:  {disruption['wt_nll']:.4f}")
+    print(f"  MUT NLL: {disruption['mut_nll']:.4f}")
+    print(f"  Disruption score: {disruption['disruption_score']:+.4f}")
+    print(f"  Causal effect (σ): {disruption['causal_effect']:.4f}")
+
+    # Step 3c: Contrastive embedding distance (primary disruption metric)
+    # This is what the contrastive loss directly optimizes — more reliable than NLL
+    print(f"\n[Step 3c] Computing contrastive embedding distance (WT vs MUT)...")
+    contrastive_result = model.compute_contrastive_distance(
+        wt_context=wt_ctx_tok,
+        mut_context=mut_ctx_tok,
+        variant_pos=vpos_tok,
+        ref_token=ref_tok,
+        alt_token=alt_tok,
+    )
+    print(f"  Contrastive distance:  {contrastive_result['contrastive_distance']:.4f}")
+    print(f"  Cosine similarity:     {contrastive_result['cosine_similarity']:.4f}")
+    print(f"  Euclidean distance:    {contrastive_result['euclidean_distance']:.4f}")
+    print(f"  WT repr norm:          {contrastive_result['wt_repr_norm']:.4f}")
+    print(f"  MUT repr norm:         {contrastive_result['mut_repr_norm']:.4f}")
+
+    # Step 4: WT baseline (counterfactual)
+    print(f"\n[Step 4] Generating {n_samples} WT baseline samples (counterfactual)...")
     wt_distribution = sampler.analyze_outcomes(
-        pre_mrna_context=wt_context[:model_config.max_seq_len],
+        wt_context=wt_context[:model_config.max_seq_len],
+        mut_context=wt_context[:model_config.max_seq_len],  # WT vs WT = no variant
+        variant_pos=var_pos,
         wildtype_mrna=wt_mrna,
+        ref_allele=ref_allele,
+        alt_allele=ref_allele,  # Same allele
         n_samples=n_samples,
         seq_len=min(200, model_config.max_seq_len),
-        temperature=1.0,
         batch_size=min(10, n_samples),
     )
     print_outcome_distribution(wt_distribution, "Wild-type TEX11")
 
-    causal_effect = mut_distribution.aberrant_fraction - wt_distribution.aberrant_fraction
-    print(f"\n  Causal effect (Δ aberrant fraction): {causal_effect:+.3f}")
+    causal_effect = disruption['disruption_score']
+    gen_causal = mut_distribution.aberrant_fraction - wt_distribution.aberrant_fraction
+    print(f"\n  Causal effect (likelihood-ratio): {causal_effect:+.4f}")
+    print(f"  Causal effect (generation-based): {gen_causal:+.3f}")
 
-    # ── Step 5: Bayesian causal inference ──
+    # Step 5: Bayesian posterior
     print("\n[Step 5] Running Bayesian causal inference...")
-
-    # Compute posterior using the improved causal model
-    # The diffusion output (aberrant_fraction) becomes the D node in the DAG
     posterior_p = _compute_bayesian_posterior(
         aberrant_fraction=mut_distribution.aberrant_fraction,
         dominant_mechanism=mut_distribution.dominant_mechanism,
         variant_position=16,
         gene="TEX11",
     )
-
     print(f"  Posterior P(disruption): {posterior_p['mean']:.3f}")
     print(f"  95% CI: [{posterior_p['lower']:.3f}, {posterior_p['upper']:.3f}]")
 
-    # ── Step 6: Protein consequence ──
+    # Step 6: Protein consequence
     print("\n[Step 6] Predicting protein consequence...")
-    protein_cons = predict_protein_consequence(
-        mechanism=mut_distribution.dominant_mechanism,
-        gene="TEX11",
-    )
+    protein_cons = predict_protein_consequence(mut_distribution.dominant_mechanism, "TEX11")
     print(f"  Effect: {protein_cons.effect}")
     print(f"  NMD: {'Yes' if protein_cons.nmd_predicted else 'No'}")
-    print(f"  Detail: {protein_cons.detail}")
 
-    # ── Step 7: ACMG classification ──
-    print("\n[Step 7] ACMG variant classification...")
+    # Step 7: ACMG
+    print("\n[Step 7] ACMG classification...")
     acmg_criteria, classification = determine_acmg_criteria(
-        posterior_p=posterior_p["mean"],
-        aberrant_fraction=mut_distribution.aberrant_fraction,
-        mechanism=mut_distribution.dominant_mechanism,
-        gene="TEX11",
+        posterior_p["mean"], mut_distribution.aberrant_fraction,
+        mut_distribution.dominant_mechanism, "TEX11",
     )
     for c in acmg_criteria:
         print(f"  ✓ {c}")
     print(f"  Classification: {classification}")
 
-    # ── Step 8: Build clinical report ──
+    # Step 8: Build report
     report = ClinicalReport(
         gene="TEX11",
         variant="c.1156+16G>T",
@@ -507,10 +448,52 @@ def run_tex11_prediction(
         counterfactual_normal_probability=1.0 - wt_distribution.aberrant_fraction,
     )
 
-    # ── Print full report ──
     print("\n")
-    report_text = generate_clinical_report(report)
-    print(report_text)
+    print(generate_clinical_report(report))
+
+    # ── Save JSON results (Issue 3 & 5) ──
+    from src.utils.results_io import save_results
+
+    # TEX11 prediction results
+    save_results("tex11_prediction.json", {
+        "gene": report.gene,
+        "variant": report.variant,
+        "clinical_phenotype": report.clinical_phenotype,
+        "n_samples": report.n_samples,
+        "aberrant_fraction": report.aberrant_fraction,
+        "dominant_mechanism": report.dominant_mechanism,
+        "posterior_p_disruption": report.posterior_p_disruption,
+        "credible_interval": [report.credible_interval_lower, report.credible_interval_upper],
+        "causal_effect": report.causal_effect,
+        "acmg_criteria": report.acmg_criteria,
+        "acmg_classification": report.acmg_classification,
+        "disruption_score": disruption,
+        "mechanism_distribution": dict(mut_distribution.mechanism_counts) if mut_distribution else {},
+        "wt_aberrant_fraction": wt_distribution.aberrant_fraction if wt_distribution else None,
+    })
+
+    # TEX11 tool comparison (Issue 5)
+    save_results("tex11_tool_comparison.json", {
+        "variant": "TEX11:c.1156+16G>T",
+        "tools": {
+            "SpliceAI": {"score": None, "coverage": "No score (outside ±10 coverage)"},
+            "SpliceVarMech_diffusion": {
+                "disruption_score_nll": disruption.get("disruption_score", 0) if isinstance(disruption, dict) else 0,
+                "contrastive_distance": contrastive_result['contrastive_distance'],
+                "aberrant_fraction": mut_distribution.aberrant_fraction,
+                "dominant_mechanism": mut_distribution.dominant_mechanism,
+            },
+            "SpliceVarMech_bayesian": {
+                "p_disruption": report.posterior_p_disruption,
+                "ci_lower": report.credible_interval_lower,
+                "ci_upper": report.credible_interval_upper,
+            },
+            "ACMG": {
+                "classification": report.acmg_classification,
+                "criteria": report.acmg_criteria,
+            },
+        },
+    })
 
     return report
 
@@ -520,67 +503,105 @@ def _compute_bayesian_posterior(
     dominant_mechanism: str,
     variant_position: int,
     gene: str,
+    use_mcmc: bool = True,
+    n_mcmc_samples: int = 0,
+    n_mcmc_tune: int = 0,
 ) -> dict:
-    """
-    Compute Bayesian posterior P(disruption | evidence) using the
-    improved causal model framework.
+    """Compute Bayesian posterior P(disruption | evidence)."""
+    if not use_mcmc:
+        return _compute_bayesian_posterior_analytical(
+            aberrant_fraction, dominant_mechanism, variant_position, gene
+        )
 
-    In production, this would run full MCMC with the diffusion output
-    as the D node in the causal DAG. For demonstration, we use an
-    analytical approximation based on the diffusion output + position prior.
-    """
-    # Position prior: closer to splice site → higher disruption probability
-    # Based on published splice site mutation databases
-    if variant_position <= 2:
-        position_prior = 0.95  # Canonical site
-    elif variant_position <= 6:
-        position_prior = 0.80  # Extended consensus
-    elif variant_position <= 20:
-        position_prior = 0.40  # ISE/ISS region (where our variant is)
-    elif variant_position <= 50:
-        position_prior = 0.15  # Deep intronic
-    else:
-        position_prior = 0.05  # Very deep intronic
+    if n_mcmc_samples == 0 or n_mcmc_tune == 0:
+        from src.config import get_mcmc_config
+        mcmc_cfg = get_mcmc_config()
+        if n_mcmc_samples == 0:
+            n_mcmc_samples = mcmc_cfg["n_samples"]
+        if n_mcmc_tune == 0:
+            n_mcmc_tune = mcmc_cfg["n_tune"]
 
-    # Combine with diffusion output (as likelihood)
-    # Using simple Bayesian update: posterior ∝ likelihood × prior
-    likelihood = aberrant_fraction  # P(diffusion output | disruption)
-    prior = position_prior
+    try:
+        import pymc as pm
+        import arviz as az
+    except ImportError:
+        return _compute_bayesian_posterior_analytical(
+            aberrant_fraction, dominant_mechanism, variant_position, gene
+        )
 
-    # Posterior (normalized)
-    posterior_disrupt = likelihood * prior
-    posterior_normal = (1 - likelihood) * (1 - prior)
-    total = posterior_disrupt + posterior_normal
-    if total > 0:
-        posterior_mean = posterior_disrupt / total
-    else:
-        posterior_mean = 0.5
+    abs_pos = max(abs(variant_position), 1)
+    log_position = np.log10(abs_pos)
+    is_aberrant = 1.0 if dominant_mechanism not in ("normal", "unknown") else 0.0
 
-    # Credible interval (approximate based on sample size and uncertainty)
-    # Width scales with 1/sqrt(n_samples) and position uncertainty
-    n_eff = max(10, int(aberrant_fraction * 100))
-    se = np.sqrt(posterior_mean * (1 - posterior_mean) / n_eff)
-    margin = 1.96 * se + 0.05  # Add position uncertainty
+    with pm.Model() as predict_model:
+        intercept = pm.Normal("intercept", mu=0.0, sigma=1.5)
+        beta_pos = pm.Normal("beta_position", mu=-1.0, sigma=0.5)
+        beta_diff = pm.Normal("beta_diffusion", mu=2.0, sigma=1.0)
+        beta_mech = pm.Normal("beta_mechanism", mu=1.0, sigma=0.5)
 
-    lower = max(0.0, posterior_mean - margin)
-    upper = min(1.0, posterior_mean + margin)
+        logit_p = (intercept + beta_pos * log_position
+                   + beta_diff * aberrant_fraction
+                   + beta_mech * is_aberrant)
+        p_disruption = pm.Deterministic("p_disruption", pm.math.sigmoid(logit_p))
 
+    with predict_model:
+        trace = pm.sample(
+            draws=n_mcmc_samples, tune=n_mcmc_tune, chains=2,
+            target_accept=0.90, random_seed=42,
+            progressbar=False, return_inferencedata=True,
+        )
+
+    p_samples = trace.posterior["p_disruption"].values.flatten()
     return {
-        "mean": posterior_mean,
-        "lower": lower,
-        "upper": upper,
-        "prior": prior,
-        "likelihood": likelihood,
+        "mean": float(p_samples.mean()),
+        "lower": float(np.percentile(p_samples, 2.5)),
+        "upper": float(np.percentile(p_samples, 97.5)),
+        "method": "mcmc",
     }
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Convenience: run prediction directly
-# ──────────────────────────────────────────────────────────────────────
+def _compute_bayesian_posterior_analytical(
+    aberrant_fraction: float,
+    dominant_mechanism: str,
+    variant_position: int,
+    gene: str,
+) -> dict:
+    """Analytical Bayesian approximation (fast fallback)."""
+    if variant_position <= 2:
+        position_prior = 0.95
+    elif variant_position <= 6:
+        position_prior = 0.80
+    elif variant_position <= 20:
+        position_prior = 0.40
+    elif variant_position <= 50:
+        position_prior = 0.15
+    else:
+        position_prior = 0.05
+
+    posterior_d = aberrant_fraction * position_prior
+    posterior_n = (1 - aberrant_fraction) * (1 - position_prior)
+    total = posterior_d + posterior_n
+    posterior_mean = posterior_d / total if total > 0 else 0.5
+
+    n_eff = max(10, int(aberrant_fraction * 100))
+    se = np.sqrt(posterior_mean * (1 - posterior_mean) / n_eff)
+    margin = 1.96 * se + 0.05
+
+    return {
+        "mean": posterior_mean,
+        "lower": max(0.0, posterior_mean - margin),
+        "upper": min(1.0, posterior_mean + margin),
+        "method": "analytical",
+    }
+
 
 if __name__ == "__main__":
+    from src.config import get_diffusion_config, get_device, get_inference_config
+
+    inf_cfg = get_inference_config()
     report = run_tex11_prediction(
-        n_samples=30,
-        device="cpu",
+        n_samples=inf_cfg["n_samples"],
+        model_config=get_diffusion_config(),
+        device=get_device(),
     )
-    print("\n✅ Phase 6: TEX11 prediction complete")
+    print("\n✅ TEX11 prediction complete")

@@ -536,11 +536,11 @@ OUR_METHOD = LiteratureBenchmark(
     predicts_mechanism=True,
     generates_sequence=True,
     provides_uncertainty=True,
-    tissue_aware=False,  # Future: can incorporate tissue-specific features
+    tissue_aware=True,   # Tissue-conditioned generation via learned embedding
     explains_prediction=True,
     limitations=[
         "Small gold standard (31 matched variants for evaluation)",
-        "Synthetic pre-training data (GENCODE integration needed for production)",
+        "Synthetic pre-training data (GENCODE integration recommended)",
         "TEX11 prediction awaits experimental validation",
         "No tissue-specific splicing factor integration (planned future work)",
     ],
@@ -695,6 +695,24 @@ def run_benchmark_comparison(
         print(f"  {'Tissue-specific prediction':<35s} {'Pangolin/AbSplice':<20s} {'Planned':<20s}")
         print(f"  {'Inference speed':<35s} {'<1 sec':<20s} {'~5-10 min':<20s}")
         print(f"  {'Evaluation scale':<35s} {'10K-50K variants':<20s} {'31 variants':<20s}")
+
+    # ── Save JSON results ──
+    from src.utils.results_io import save_results
+    save_results("benchmark_comparison.json", {
+        "literature_benchmarks": [
+            {"method": bm.method, "year": bm.year, "approach": bm.approach,
+             "reported_auroc": bm.reported_auroc, "evaluation_dataset": bm.evaluation_dataset,
+             "n_variants": bm.n_variants, "predicts_mechanism": bm.predicts_mechanism,
+             "generates_sequence": bm.generates_sequence, "provides_uncertainty": bm.provides_uncertainty,
+             "tissue_aware": bm.tissue_aware, "explains_prediction": bm.explains_prediction}
+            for bm in LITERATURE_BENCHMARKS
+        ],
+        "our_method": {
+            "auroc": our_auroc, "balanced_accuracy": our_balanced_accuracy,
+            "predicts_mechanism": True, "generates_sequence": True,
+            "provides_uncertainty": True, "tissue_aware": True, "explains_prediction": True,
+        },
+    }, verbose=verbose)
 
     return {
         "literature_benchmarks": LITERATURE_BENCHMARKS,

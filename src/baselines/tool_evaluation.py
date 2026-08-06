@@ -385,6 +385,35 @@ def run_baseline_evaluation(verbose: bool = True) -> dict:
         print(f"\n  KEY FINDING: Our framework must beat these baselines.")
         print(f"  Target: AUROC > 0.90, Balanced Accuracy > 80%")
 
+    # ── Save JSON results ──
+    from src.utils.results_io import save_results
+    json_data = {
+        "per_tool": [
+            {
+                "tool": r.tool_name, "auroc": r.auroc, "auprc": r.auprc,
+                "sensitivity": r.sensitivity, "specificity": r.specificity,
+                "balanced_accuracy": r.balanced_accuracy, "coverage_pct": r.coverage_pct,
+                "n_scored": r.n_scored, "optimal_threshold": r.optimal_threshold,
+            }
+            for r in tool_results
+        ],
+        "ensemble": {
+            "majority_vote": {
+                "auroc": mv_result.auroc, "auprc": mv_result.auprc,
+                "sensitivity": mv_result.sensitivity, "specificity": mv_result.specificity,
+                "balanced_accuracy": mv_result.balanced_accuracy,
+            },
+            "mean_zscore": {
+                "auroc": mz_result.auroc, "auprc": mz_result.auprc,
+                "sensitivity": mz_result.sensitivity, "specificity": mz_result.specificity,
+                "balanced_accuracy": mz_result.balanced_accuracy,
+            },
+        },
+        "n_positives": len(gs_scores.matched_positives),
+        "n_negatives": len(gs_scores.matched_negatives),
+    }
+    save_results("baseline_tools.json", json_data, verbose=verbose)
+
     return {
         "tool_results": tool_results,
         "majority_vote": mv_result,

@@ -2,7 +2,7 @@
 SpliceVarMech — Structural Causal Model (DAG) Definition
 
 Defines the biologically grounded causal DAG for splice variant interpretation.
-The DAG encodes known biology of splice site recognition as causal relationships
+The DAG encodes the known biology of splice site recognition as causal relationships
 between variant properties and splicing outcomes.
 
 Causal Variables (Nodes):
@@ -19,11 +19,6 @@ Causal Edges:
     V → S, V → E, V → I
     P → S, P → I  
     C → O, S → O, E → O, I → O, D → O
-
-Model Versions:
-    v1 (build_causal_model):      Original — 5 features, flat priors, unweighted
-    v2 (build_improved_model):    Improved — class-balanced, expanded features,
-                                  hierarchical shrinkage, consensus features
 """
 
 from __future__ import annotations
@@ -74,16 +69,14 @@ class CausalFeatures:
     # I — ISE/ISS impact (from Spliceogen as proxy for intronic reg.)
     ise_iss_score: Optional[float] = None  # Spliceogen score
     
-    # D — Diffusion model output (placeholder — will be filled by Module 1)
+    # D — Diffusion model output (filled by Module 1 at inference)
     diffusion_aberrant_fraction: Optional[float] = None
+    diffusion_disruption_score: Optional[float] = None
+    diffusion_contrastive_distance: Optional[float] = None
+    diffusion_wt_mut_cosine_distance: Optional[float] = None
+    diffusion_mechanism_type: str = "unknown"  # normal, exon_skipping, intron_retention, etc.
     
-    # Additional tool scores as auxiliary evidence
-    splice_ai: Optional[float] = None
-    squirls: Optional[float] = None
-    mmsplice: Optional[float] = None
-    cadd_splice: Optional[float] = None
-    
-    # All raw scores for expanded model
+    # Raw splice tool scores — stored for reference/baselines ONLY, NOT used in Bayesian model
     all_scores: Optional[dict] = None
     
     # Label (ground truth for training/evaluation)
@@ -113,12 +106,8 @@ def extract_causal_features_from_scores(
         ese_ess_score=splice_scores.get("ESRseq"),
         conservation=splice_scores.get("CADDsplice_phred"),
         ise_iss_score=splice_scores.get("Spliceogen"),
-        splice_ai=splice_scores.get("spliceAI_max_score"),
-        squirls=splice_scores.get("Squirls_max_score"),
-        mmsplice=splice_scores.get("mmsplice_delta_logit_psi"),
-        cadd_splice=splice_scores.get("CADDsplice_phred"),
-        all_scores=dict(splice_scores),  # keep full scores for v2 model
-        diffusion_aberrant_fraction=None,  # Placeholder for Module 1
+        all_scores=dict(splice_scores),  # keep full scores for baseline evaluation only
+        diffusion_aberrant_fraction=None,  # Placeholder — filled by diffusion model
         label=label,
         variant_type=variant_type,
         donor_or_acceptor="D" if position > 0 else ("A" if position < 0 else "Unknown"),
@@ -185,53 +174,102 @@ def count_tools_available(scores: dict[str, Optional[float]]) -> int:
     return sum(1 for v in scores.values() if v is not None)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# ESE/ESS hexamer scoring (FIX for Problem 6: Missing Features)
+# ──────────────────────────────────────────────────────────────────────
+
+# RESCUE-ESE hexamers (Fairbrother et al., Science 2002)
+RESCUE_ESE_HEXAMERS = {
+    "GAAGAA", "GGAGGA", "AAGAAG", "GACGAC", "AAGAAC",
+    "GAAGGC", "AGAAGA", "GAAGAG", "AACAAG", "GAAGAT",
+    "GAAGCA", "GAAGTA", "GAAGGA", "AAGAGC", "AAGACA",
+    "AAGAGG", "AAGAGT", "GAAGAC", "AAGAAT", "GAGAAG",
+}
+
+# FAS-ESS hexamers (Wang et al., Genes Dev 2004)
+FAS_ESS_HEXAMERS = {
+    "CCAGCC", "TAGGTC", "CCAACC", "CCACCC", "TTAGCC",
+    "CTAGCC", "CTAGGG", "CCAGGG", "TTAGGG", "GCAGCC",
+    "CCAGCA", "TCAGCC", "GTAGCC", "CCGGCC", "CCAGCG",
+    "CCAGGC", "GTAGGG", "CTGGCC", "CCAGCT", "CCTGCC",
+}
+
+
+def compute_ese_ess_balance(sequence: str, window: int = 50) -> float:
+    """
+    Compute ESE/ESS hexamer balance for a sequence.
+    
+    Returns: (n_ESE - n_ESS) / total_hexamers
+    Positive = ESE-rich (enhances exon inclusion)
+    Negative = ESS-rich (silences exon inclusion)
+    Zero = balanced or no hexamers found
+    """
+    if len(sequence) < 6:
+        return 0.0
+    
+    seq = sequence.upper()
+    n_ese = 0
+    n_ess = 0
+    
+    for i in range(len(seq) - 5):
+        hexamer = seq[i:i+6]
+        if hexamer in RESCUE_ESE_HEXAMERS:
+            n_ese += 1
+        if hexamer in FAS_ESS_HEXAMERS:
+            n_ess += 1
+    
+    total = n_ese + n_ess
+    if total == 0:
+        return 0.0
+    return (n_ese - n_ess) / total
+
+
 def build_feature_matrix(features_list: list[CausalFeatures]) -> tuple[np.ndarray, list[str]]:
     """
-    Build the expanded feature matrix for the improved model.
+    Build the feature matrix for the Bayesian causal model.
+    
+    Uses DIFFUSION MODEL features (not splice tool scores) as the primary
+    signal, plus position and variant type as non-diffusion features.
     
     Features:
-      1. position (raw)
-      2. abs_position (absolute distance from splice site)
-      3. is_exonic (binary: position == 0)
-      4-9. Core tool scores (CADD, MaxEntScan, GeneSplicer, ESRseq, Spliceogen, Squirls)
-      10. SpliceAI (imputed 0 if missing)
-      11. SpliceAI_missing (binary indicator)
-      12. mmsplice (imputed 0 if missing)
-      13. mmsplice_missing (binary indicator)
-      14. consensus_score (fraction of tools above pathogenic thresholds)
-      15. tool_disagreement (std of normalized scores)
-      16. n_tools_available (count of non-missing tools)
+      1. position — raw position relative to splice site
+      2. abs_position — absolute distance from splice site
+      3. is_exonic — binary: position == 0
+      4. diffusion_disruption_score — contrastive embedding distance (WT vs MUT)
+      5. diffusion_aberrant_fraction — fraction of generated mRNAs that are aberrant
+      6. diffusion_contrastive_distance — cosine distance between WT/MUT embeddings
+      7. is_mechanism_exon_skipping — binary: dominant mechanism
+      8. is_mechanism_intron_retention — binary: dominant mechanism
+      9. is_missense — binary: variant type == Mis
+      10. is_intronic — binary: variant type == Intron
     
     Returns:
         (feature_matrix, feature_names) where matrix is (n_variants, n_features)
     """
-    n = len(features_list)
     rows = []
     
     for f in features_list:
-        scores = f.all_scores or {}
+        # Diffusion model features (0.0 if not yet computed)
+        disruption = float(f.diffusion_disruption_score if f.diffusion_disruption_score is not None else 0.0)
+        aberrant = float(f.diffusion_aberrant_fraction if f.diffusion_aberrant_fraction is not None else 0.0)
+        contrastive = float(f.diffusion_contrastive_distance if f.diffusion_contrastive_distance is not None else 0.0)
+        mech = getattr(f, 'diffusion_mechanism_type', 'unknown')
+        
         row = [
-            # Position features
+            # Position features (non-diffusion)
             float(f.position),
             float(abs(f.position)),
             1.0 if f.position == 0 else 0.0,
-            # Core tool scores (high coverage — available for all/most)
-            float(f.conservation if f.conservation is not None else 0.0),
-            float(f.splice_strength if f.splice_strength is not None else 0.0),
-            float(scores.get("GeneSplicer", 0.0) or 0.0),
-            float(f.ese_ess_score if f.ese_ess_score is not None else 0.0),
-            float(f.ise_iss_score if f.ise_iss_score is not None else 0.0),
-            float(f.squirls if f.squirls is not None else 0.0),
-            # SpliceAI with missingness indicator
-            float(f.splice_ai if f.splice_ai is not None else 0.0),
-            1.0 if f.splice_ai is None else 0.0,
-            # MMSplice with missingness indicator
-            float(f.mmsplice if f.mmsplice is not None else 0.0),
-            1.0 if f.mmsplice is None else 0.0,
-            # Derived consensus/disagreement features
-            compute_consensus_score(scores),
-            compute_tool_disagreement(scores),
-            float(count_tools_available(scores)),
+            # Diffusion model features (primary signal)
+            disruption,
+            aberrant,
+            contrastive,
+            # Mechanism type indicators
+            1.0 if mech == "exon_skipping" else 0.0,
+            1.0 if mech == "intron_retention" else 0.0,
+            # Variant type indicators (non-diffusion)
+            1.0 if getattr(f, 'variant_type', '') == 'Mis' else 0.0,
+            1.0 if getattr(f, 'variant_type', '') == 'Intron' else 0.0,
         ]
         rows.append(row)
     
@@ -239,19 +277,13 @@ def build_feature_matrix(features_list: list[CausalFeatures]) -> tuple[np.ndarra
         "position",
         "abs_position",
         "is_exonic",
-        "CADD",
-        "MaxEntScan",
-        "GeneSplicer",
-        "ESRseq",
-        "Spliceogen",
-        "Squirls",
-        "SpliceAI",
-        "SpliceAI_missing",
-        "MMSplice",
-        "MMSplice_missing",
-        "consensus_score",
-        "tool_disagreement",
-        "n_tools_available",
+        "diffusion_disruption_score",
+        "diffusion_aberrant_fraction",
+        "diffusion_contrastive_distance",
+        "is_mechanism_exon_skipping",
+        "is_mechanism_intron_retention",
+        "is_missense",
+        "is_intronic",
     ]
     
     return np.array(rows, dtype=np.float64), feature_names
@@ -260,6 +292,59 @@ def build_feature_matrix(features_list: list[CausalFeatures]) -> tuple[np.ndarra
 # ──────────────────────────────────────────────────────────────────────
 # Evaluation utilities
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _compute_auroc_auprc(p_disruption: np.ndarray, true_labels: np.ndarray) -> tuple[float, float]:
+    """
+    Compute AUROC and AUPRC using rank-based method (no sklearn needed).
+    
+    AUROC: probability that a random positive is scored higher than a random negative.
+    AUPRC: area under precision-recall curve (better for imbalanced data).
+    """
+    n_pos = int(true_labels.sum())
+    n_neg = len(true_labels) - n_pos
+    
+    if n_pos == 0 or n_neg == 0:
+        return 0.5, float(n_pos) / len(true_labels)
+    
+    # Sort by predicted score descending
+    sorted_idx = np.argsort(-p_disruption)
+    sorted_labels = true_labels[sorted_idx]
+    sorted_scores = p_disruption[sorted_idx]
+    
+    # AUROC via trapezoidal rule on ROC
+    tpr_list = [0.0]
+    fpr_list = [0.0]
+    tp_cum, fp_cum = 0, 0
+    for i in range(len(sorted_labels)):
+        if sorted_labels[i] == 1:
+            tp_cum += 1
+        else:
+            fp_cum += 1
+        tpr_list.append(tp_cum / n_pos)
+        fpr_list.append(fp_cum / n_neg)
+    
+    auroc = 0.0
+    for i in range(1, len(fpr_list)):
+        auroc += (fpr_list[i] - fpr_list[i-1]) * (tpr_list[i] + tpr_list[i-1]) / 2
+    
+    # AUPRC via trapezoidal rule on PR curve
+    prec_list = [1.0]
+    rec_list = [0.0]
+    tp_cum = 0
+    for i in range(len(sorted_labels)):
+        if sorted_labels[i] == 1:
+            tp_cum += 1
+        prec = tp_cum / (i + 1)
+        rec = tp_cum / n_pos
+        prec_list.append(prec)
+        rec_list.append(rec)
+    
+    auprc = 0.0
+    for i in range(1, len(rec_list)):
+        auprc += (rec_list[i] - rec_list[i-1]) * (prec_list[i] + prec_list[i-1]) / 2
+    
+    return auroc, auprc
 
 
 def evaluate_predictions(
@@ -272,11 +357,11 @@ def evaluate_predictions(
     Comprehensive evaluation metrics for the causal model predictions.
     
     Reports:
-      - Overall accuracy
+      - AUROC (threshold-free, suitable for imbalanced data)
+      - AUPRC (better than AUROC for class imbalance)
       - Balanced accuracy (mean of per-class accuracies)
       - Sensitivity (true positive rate) & Specificity (true negative rate)
       - Matthews Correlation Coefficient (MCC)
-      - Per-class accuracy
     """
     predictions = (p_disruption > threshold).astype(int)
     
@@ -287,8 +372,8 @@ def evaluate_predictions(
     
     n = len(true_labels)
     accuracy = (tp + tn) / n if n > 0 else 0.0
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0  # recall for positives
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0  # recall for negatives
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
     balanced_acc = (sensitivity + specificity) / 2.0
     
     # Matthews Correlation Coefficient
@@ -299,6 +384,9 @@ def evaluate_predictions(
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     f1 = 2 * precision * sensitivity / (precision + sensitivity) if (precision + sensitivity) > 0 else 0.0
     
+    # AUROC & AUPRC (threshold-free metrics — more appropriate for imbalanced data)
+    auroc, auprc = _compute_auroc_auprc(p_disruption, true_labels)
+    
     results = {
         "accuracy": accuracy,
         "balanced_accuracy": balanced_acc,
@@ -307,6 +395,8 @@ def evaluate_predictions(
         "mcc": mcc,
         "precision": precision,
         "f1": f1,
+        "auroc": auroc,
+        "auprc": auprc,
         "tp": tp, "tn": tn, "fp": fp, "fn": fn,
     }
     
@@ -314,6 +404,8 @@ def evaluate_predictions(
         print(f"\n  [{label}] Evaluation (threshold={threshold}):")
     else:
         print(f"\n  Evaluation (threshold={threshold}):")
+    print(f"    AUROC:             {auroc:.3f}")
+    print(f"    AUPRC:             {auprc:.3f}")
     print(f"    Accuracy:          {accuracy:.1%} ({tp + tn}/{n})")
     print(f"    Balanced Accuracy: {balanced_acc:.1%}")
     print(f"    Sensitivity (TPR): {sensitivity:.1%} ({tp}/{tp + fn} positives correct)")
@@ -325,111 +417,6 @@ def evaluate_predictions(
     
     return results
 
-
-# ──────────────────────────────────────────────────────────────────────
-# MODEL V1: Original Bayesian Causal Model (baseline)
-# ──────────────────────────────────────────────────────────────────────
-
-
-def build_causal_model(
-    features_list: list[CausalFeatures],
-    model_name: str = "SpliceVarMech_SCM",
-) -> tuple[pm.Model, dict]:
-    """
-    Build the original PyMC Bayesian structural causal model (v1 baseline).
-    
-    Uses 5 features with flat Normal priors and unweighted Bernoulli likelihood.
-    This model suffers from class imbalance bias (predicts positive for everything).
-    """
-    n = len(features_list)
-    
-    # ── Prepare observed data arrays ──
-    def safe_array(values: list[Optional[float]], default: float = 0.0) -> np.ndarray:
-        return np.array([v if v is not None else default for v in values], dtype=np.float64)
-    
-    positions = safe_array([f.position for f in features_list])
-    splice_strength = safe_array([f.splice_strength for f in features_list])
-    ese_scores = safe_array([f.ese_ess_score for f in features_list])
-    conservation = safe_array([f.conservation for f in features_list])
-    ise_scores = safe_array([f.ise_iss_score for f in features_list])
-    
-    # Standardize features for better MCMC convergence
-    def standardize(arr: np.ndarray) -> np.ndarray:
-        std = arr.std()
-        if std < 1e-10:
-            return arr - arr.mean()
-        return (arr - arr.mean()) / std
-    
-    pos_std = standardize(positions)
-    ss_std = standardize(splice_strength)
-    ese_std = standardize(ese_scores)
-    cons_std = standardize(conservation)
-    ise_std = standardize(ise_scores)
-    
-    # Has diffusion output?
-    has_diffusion = any(f.diffusion_aberrant_fraction is not None for f in features_list)
-    if has_diffusion:
-        diff_scores = safe_array([f.diffusion_aberrant_fraction for f in features_list])
-        diff_std = standardize(diff_scores)
-    
-    # Labels (observed outcomes)
-    labels = np.array([f.label if f.label is not None else -1 for f in features_list])
-    has_labels = (labels >= 0).all()
-    
-    observed_data = {
-        "positions": pos_std,
-        "splice_strength": ss_std,
-        "ese_scores": ese_std,
-        "conservation": cons_std,
-        "ise_scores": ise_std,
-        "labels": labels,
-        "n_variants": n,
-    }
-    
-    # ── Build PyMC model ──
-    with pm.Model(name=model_name) as model:
-        
-        # Intercept
-        intercept = pm.Normal("intercept", mu=0.0, sigma=2.0)
-        
-        # β coefficients with exploratory priors
-        beta_splice = pm.Normal("beta_splice_strength", mu=0.0, sigma=1.0)
-        beta_ese = pm.Normal("beta_ese", mu=0.0, sigma=1.0)
-        beta_conservation = pm.Normal("beta_conservation", mu=0.5, sigma=0.5)
-        beta_ise = pm.Normal("beta_ise", mu=0.0, sigma=1.0)
-        beta_position = pm.Normal("beta_position", mu=0.0, sigma=1.0)
-        
-        if has_diffusion:
-            beta_diffusion = pm.Normal("beta_diffusion", mu=1.0, sigma=0.5)
-        
-        # Logistic regression
-        logit_p = (
-            intercept
-            + beta_splice * ss_std
-            + beta_ese * ese_std
-            + beta_conservation * cons_std
-            + beta_ise * ise_std
-            + beta_position * pos_std
-        )
-        
-        if has_diffusion:
-            logit_p = logit_p + beta_diffusion * diff_std
-        
-        p_disruption = pm.Deterministic("p_disruption", pm.math.sigmoid(logit_p))
-        
-        if has_labels:
-            outcome = pm.Bernoulli(
-                "outcome",
-                p=p_disruption,
-                observed=labels,
-            )
-    
-    return model, observed_data
-
-
-# ──────────────────────────────────────────────────────────────────────
-# MODEL V2: Improved Bayesian Causal Model
-# ──────────────────────────────────────────────────────────────────────
 
 
 def build_improved_model(
@@ -462,7 +449,10 @@ def build_improved_model(
     n_features = X_raw.shape[1]
     
     # ── Standardize continuous features (leave binary indicators as-is) ──
-    binary_features = {"is_exonic", "SpliceAI_missing", "MMSplice_missing"}
+    binary_features = {
+        "is_exonic", "is_mechanism_exon_skipping", "is_mechanism_intron_retention",
+        "is_missense", "is_intronic",
+    }
     X_std = X_raw.copy()
     feature_means = np.zeros(n_features)
     feature_stds = np.ones(n_features)
@@ -584,17 +574,72 @@ def build_improved_model(
     return model, observed_data
 
 
+# Alias: build_causal_model → build_improved_model (backward compatibility)
+build_causal_model = build_improved_model
+
+
 # ──────────────────────────────────────────────────────────────────────
 # MCMC Inference
 # ──────────────────────────────────────────────────────────────────────
 
 
+def platt_scaling(
+    predictions: np.ndarray,
+    true_labels: np.ndarray,
+    val_predictions: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, dict]:
+    """
+    Platt scaling: post-hoc sigmoid recalibration.
+    
+    Fits P_calibrated = sigmoid(a * logit(P_raw) + b) on training data.
+    Reduces ECE by mapping predicted probabilities to match observed frequencies.
+    
+    FIX for Problem 5: Poor Calibration (ECE=0.161)
+    
+    Args:
+        predictions: Raw model predictions [n_samples]
+        true_labels: Binary labels [n_samples]
+        val_predictions: Optional held-out predictions to calibrate (if None, calibrates in-sample)
+    
+    Returns:
+        (calibrated_predictions, params_dict)
+    """
+    # Convert to logits (clip to avoid inf)
+    p_clipped = np.clip(predictions, 1e-6, 1 - 1e-6)
+    logits = np.log(p_clipped / (1 - p_clipped))
+    
+    # Fit a, b via maximum likelihood (simple grid search for robustness)
+    best_nll = float('inf')
+    best_a, best_b = 1.0, 0.0
+    
+    for a in np.arange(0.5, 3.0, 0.1):
+        for b in np.arange(-2.0, 2.0, 0.1):
+            cal_logits = a * logits + b
+            cal_probs = 1.0 / (1.0 + np.exp(-cal_logits))
+            cal_probs = np.clip(cal_probs, 1e-10, 1 - 1e-10)
+            nll = -np.mean(
+                true_labels * np.log(cal_probs) + (1 - true_labels) * np.log(1 - cal_probs)
+            )
+            if nll < best_nll:
+                best_nll = nll
+                best_a, best_b = a, b
+    
+    # Apply calibration
+    target = val_predictions if val_predictions is not None else predictions
+    target_clipped = np.clip(target, 1e-6, 1 - 1e-6)
+    target_logits = np.log(target_clipped / (1 - target_clipped))
+    calibrated = 1.0 / (1.0 + np.exp(-(best_a * target_logits + best_b)))
+    
+    params = {"a": best_a, "b": best_b, "nll": best_nll}
+    return calibrated, params
+
+
 def run_inference(
     model: pm.Model,
-    n_samples: int = 2000,
-    n_tune: int = 1000,
-    n_chains: int = 2,
-    target_accept: float = 0.9,
+    n_samples: int = 4000,
+    n_tune: int = 2000,
+    n_chains: int = 4,
+    target_accept: float = 0.95,
     random_seed: int = 42,
 ) -> az.InferenceData:
     """
@@ -630,7 +675,7 @@ def extract_posteriors(trace: az.InferenceData) -> dict:
     
     # Coefficient summary
     if coef_vars:
-        summary = az.summary(trace, var_names=coef_vars, hdi_prob=0.95)
+        summary = az.summary(trace, var_names=coef_vars, ci_prob=0.95)
     else:
         summary = None
     
@@ -736,7 +781,7 @@ def find_optimal_threshold(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Convenience: run the full causal pipeline with model comparison
+# Convenience: run the causal model pipeline
 # ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -744,7 +789,7 @@ if __name__ == "__main__":
     from src.features.splice_scores import match_gold_standard_to_s1
     
     print("=" * 70)
-    print("PHASE 3: BAYESIAN CAUSAL MODEL — DIAGNOSTIC COMPARISON")
+    print("PHASE 3: BAYESIAN CAUSAL MODEL")
     print("=" * 70)
     
     # ── 1. Parse data and get gold-standard scores ──
@@ -786,7 +831,7 @@ if __name__ == "__main__":
     print(f"  Labels: {n_pos} positive, {n_neg} negative (ratio {n_pos/n_neg:.1f}:1)")
     
     # ──────────────────────────────────────────────────────────────────
-    # RUN DIAGNOSTICS FIRST
+    # RUN DIAGNOSTICS
     # ──────────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("RUNNING DIAGNOSTICS")
@@ -796,231 +841,89 @@ if __name__ == "__main__":
     diag_results = run_diagnostics(verbose=True)
     
     # ──────────────────────────────────────────────────────────────────
-    # MODEL V1: Original (baseline)
+    # BAYESIAN CAUSAL MODEL
     # ──────────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
-    print("MODEL V1: ORIGINAL CAUSAL MODEL (baseline)")
+    print("BAYESIAN CAUSAL MODEL (class-balanced, expanded features)")
     print("=" * 70)
     
-    print("\nBuilding v1 model...")
-    model_v1, obs_v1 = build_causal_model(features)
+    print("\nBuilding model...")
+    model, obs = build_improved_model(features, class_weight_strategy="balanced")
+    print(f"  Features: {obs['n_features']} ({', '.join(obs['feature_names'])})")
+    print(f"  Class weights: pos={obs['w_pos']:.3f}, neg={obs['w_neg']:.3f}")
     
-    print("Running MCMC inference (v1)...")
-    trace_v1 = run_inference(model_v1, n_samples=1000, n_tune=500, n_chains=2)
-    
-    results_v1 = extract_posteriors(trace_v1)
-    
-    print("\n" + "-" * 70)
-    print("V1 COEFFICIENT SUMMARY")
-    print("-" * 70)
-    print(results_v1["coefficient_summary"])
-    
-    print("\n" + "-" * 70)
-    print("V1 PER-VARIANT PREDICTIONS")
-    print("-" * 70)
-    for i, feat in enumerate(features):
-        p_mean = results_v1["p_disruption_mean"][i]
-        p_low = results_v1["p_disruption_lower"][i]
-        p_high = results_v1["p_disruption_upper"][i]
-        label_str = "POS" if feat.label == 1 else "NEG"
-        correct = "✅" if (p_mean > 0.5 and feat.label == 1) or (p_mean <= 0.5 and feat.label == 0) else "❌"
-        print(f"  [{label_str}] {feat.variant_name:35s} "
-              f"P(disrupt)={p_mean:.3f} [{p_low:.3f}, {p_high:.3f}] {correct}")
-    
-    eval_v1 = evaluate_predictions(
-        results_v1["p_disruption_mean"], true_labels, threshold=0.5, label="V1"
-    )
-    
-    # ──────────────────────────────────────────────────────────────────
-    # MODEL V2: Improved (class-balanced + expanded features)
-    # ──────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("MODEL V2: IMPROVED CAUSAL MODEL (class-balanced, expanded features)")
-    print("=" * 70)
-    
-    print("\nBuilding v2 model...")
-    model_v2, obs_v2 = build_improved_model(features, class_weight_strategy="balanced")
-    print(f"  Features: {obs_v2['n_features']} ({', '.join(obs_v2['feature_names'])})")
-    print(f"  Class weights: pos={obs_v2['w_pos']:.3f}, neg={obs_v2['w_neg']:.3f}")
-    
-    print("Running MCMC inference (v2)...")
-    trace_v2 = run_inference(
-        model_v2, n_samples=2000, n_tune=1000, n_chains=2,
+    print("Running MCMC inference...")
+    trace = run_inference(
+        model, n_samples=2000, n_tune=1000, n_chains=2,
         target_accept=0.95,
     )
     
-    results_v2 = extract_improved_posteriors(trace_v2, obs_v2["feature_names"])
+    results = extract_improved_posteriors(trace, obs["feature_names"])
     
     print("\n" + "-" * 70)
-    print("V2 COEFFICIENT SUMMARY")
+    print("COEFFICIENT SUMMARY")
     print("-" * 70)
-    print(results_v2["coefficient_summary"])
+    print(results["coefficient_summary"])
     
     # Feature importance
-    if "feature_importance" in results_v2:
+    if "feature_importance" in results:
         print("\n" + "-" * 70)
-        print("V2 FEATURE IMPORTANCE (|mean coefficient| ranking)")
+        print("FEATURE IMPORTANCE (|mean coefficient| ranking)")
         print("-" * 70)
-        for name, mean, std in results_v2["feature_importance"]:
+        for name, mean, std in results["feature_importance"]:
             bar = "█" * int(min(abs(mean) * 10, 30))
             sign = "+" if mean > 0 else "-"
             print(f"  {name:25s}  {sign}{abs(mean):.4f} ± {std:.4f}  {bar}")
     
     print("\n" + "-" * 70)
-    print("V2 PER-VARIANT PREDICTIONS")
+    print("PER-VARIANT PREDICTIONS")
     print("-" * 70)
     for i, feat in enumerate(features):
-        p_mean = results_v2["p_disruption_mean"][i]
-        p_low = results_v2["p_disruption_lower"][i]
-        p_high = results_v2["p_disruption_upper"][i]
+        p_mean = results["p_disruption_mean"][i]
+        p_low = results["p_disruption_lower"][i]
+        p_high = results["p_disruption_upper"][i]
         label_str = "POS" if feat.label == 1 else "NEG"
         correct = "✅" if (p_mean > 0.5 and feat.label == 1) or (p_mean <= 0.5 and feat.label == 0) else "❌"
         print(f"  [{label_str}] {feat.variant_name:35s} "
               f"P(disrupt)={p_mean:.3f} [{p_low:.3f}, {p_high:.3f}] {correct}")
     
     # Evaluation at default threshold
-    eval_v2_50 = evaluate_predictions(
-        results_v2["p_disruption_mean"], true_labels, threshold=0.5, label="V2 @0.50"
+    eval_default = evaluate_predictions(
+        results["p_disruption_mean"], true_labels, threshold=0.5, label="@0.50"
     )
     
     # Find optimal threshold
     opt_thresh, opt_score = find_optimal_threshold(
-        results_v2["p_disruption_mean"], true_labels, metric="balanced_accuracy"
+        results["p_disruption_mean"], true_labels, metric="balanced_accuracy"
     )
     print(f"\n  Optimal threshold (max balanced accuracy): {opt_thresh:.2f} → {opt_score:.1%}")
     
-    eval_v2_opt = evaluate_predictions(
-        results_v2["p_disruption_mean"], true_labels, threshold=opt_thresh,
-        label=f"V2 @{opt_thresh:.2f}",
+    eval_opt = evaluate_predictions(
+        results["p_disruption_mean"], true_labels, threshold=opt_thresh,
+        label=f"@{opt_thresh:.2f} (optimal)",
     )
-    
-    # ──────────────────────────────────────────────────────────────────
-    # MODEL V2b: Moderate weighting (sqrt strategy)
-    # ──────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("MODEL V2b: SQRT-WEIGHTED (moderate class balancing)")
-    print("=" * 70)
-    
-    model_v2b, obs_v2b = build_improved_model(features, class_weight_strategy="sqrt")
-    print(f"  Class weights: pos={obs_v2b['w_pos']:.3f}, neg={obs_v2b['w_neg']:.3f}")
-    
-    print("Running MCMC inference (v2b)...")
-    trace_v2b = run_inference(
-        model_v2b, n_samples=2000, n_tune=1000, n_chains=2,
-        target_accept=0.95,
-    )
-    
-    results_v2b = extract_improved_posteriors(trace_v2b, obs_v2b["feature_names"])
-    
-    print("\n" + "-" * 70)
-    print("V2b PER-VARIANT PREDICTIONS")
-    print("-" * 70)
-    for i, feat in enumerate(features):
-        p_mean = results_v2b["p_disruption_mean"][i]
-        p_low = results_v2b["p_disruption_lower"][i]
-        p_high = results_v2b["p_disruption_upper"][i]
-        label_str = "POS" if feat.label == 1 else "NEG"
-        correct = "✅" if (p_mean > 0.5 and feat.label == 1) or (p_mean <= 0.5 and feat.label == 0) else "❌"
-        print(f"  [{label_str}] {feat.variant_name:35s} "
-              f"P(disrupt)={p_mean:.3f} [{p_low:.3f}, {p_high:.3f}] {correct}")
-    
-    eval_v2b = evaluate_predictions(
-        results_v2b["p_disruption_mean"], true_labels, threshold=0.5, label="V2b @0.50"
-    )
-    
-    opt_thresh_b, opt_score_b = find_optimal_threshold(
-        results_v2b["p_disruption_mean"], true_labels, metric="balanced_accuracy"
-    )
-    eval_v2b_opt = evaluate_predictions(
-        results_v2b["p_disruption_mean"], true_labels, threshold=opt_thresh_b,
-        label=f"V2b @{opt_thresh_b:.2f}",
-    )
-    
-    # ──────────────────────────────────────────────────────────────────
-    # COMPARISON SUMMARY
-    # ──────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("MODEL COMPARISON SUMMARY")
-    print("=" * 70)
-    
-    print(f"\n{'Model':<30s} {'Accuracy':>10s} {'Bal.Acc':>10s} {'Sens':>8s} {'Spec':>8s} {'MCC':>8s} {'F1':>8s}")
-    print("-" * 82)
-    
-    all_evals = [
-        ("V1 Original @0.50", eval_v1),
-        ("V2 Balanced @0.50", eval_v2_50),
-        (f"V2 Balanced @{opt_thresh:.2f} (opt)", eval_v2_opt),
-        ("V2b Sqrt @0.50", eval_v2b),
-        (f"V2b Sqrt @{opt_thresh_b:.2f} (opt)", eval_v2b_opt),
-    ]
-    
-    for name, ev in all_evals:
-        print(
-            f"  {name:<28s} "
-            f"{ev['accuracy']:>9.1%} "
-            f"{ev['balanced_accuracy']:>9.1%} "
-            f"{ev['sensitivity']:>7.1%} "
-            f"{ev['specificity']:>7.1%} "
-            f"{ev['mcc']:>+7.3f} "
-            f"{ev['f1']:>7.3f}"
-        )
-    
-    print("\n" + "=" * 70)
-    print("INTERPRETATION")
-    print("=" * 70)
-    print("""
-  KEY FINDINGS:
-  
-  1. V1 (original) achieves high sensitivity but near-zero specificity
-     → predicts "disruption" for everything due to class imbalance bias
-  
-  2. V2 (class-balanced) improves specificity at some cost to sensitivity
-     → the model can now learn to reject some negatives
-  
-  3. Feature importance reveals which signals are genuinely discriminative
-     vs. which are uniformly high across both classes
-  
-  4. The optimal threshold differs from 0.5 — reflecting the inherent
-     difficulty of separating these classes with tool scores alone
-  
-  FUNDAMENTAL INSIGHT — validates the project thesis:
-  
-  • Tool scores ALONE cannot reliably separate true splice-disrupting
-    variants from false positives. This is because the negatives were
-    selected precisely because tools predicted disruption.
-  
-  • The diffusion model (Module 1) is essential: it provides SEQUENCE-LEVEL
-    features that capture splice site biology beyond what aggregate tool
-    scores can express. When diffusion features become available, they
-    will enter the causal model via the β_diffusion coefficient.
-  
-  • The improved Bayesian model (V2) provides the correct FRAMEWORK for
-    integrating diffusion features. The class-balanced likelihood and
-    hierarchical shrinkage prior ensure the model won't overfit when
-    those features are added.
-""")
     
     # ── MCMC diagnostics ──
-    print("=" * 70)
-    print("MCMC CONVERGENCE DIAGNOSTICS (V2)")
+    print("\n" + "=" * 70)
+    print("MCMC CONVERGENCE DIAGNOSTICS")
     print("=" * 70)
     
     # Check divergences
-    if hasattr(trace_v2, 'sample_stats'):
-        stats_vars = list(trace_v2.sample_stats.data_vars)
+    if hasattr(trace, 'sample_stats'):
+        stats_vars = list(trace.sample_stats.data_vars)
         if 'diverging' in stats_vars:
-            n_div = int(trace_v2.sample_stats['diverging'].sum().values)
+            n_div = int(trace.sample_stats['diverging'].sum().values)
         else:
             div_key = [k for k in stats_vars if 'diverg' in k.lower()]
-            n_div = int(trace_v2.sample_stats[div_key[0]].sum().values) if div_key else "?"
+            n_div = int(trace.sample_stats[div_key[0]].sum().values) if div_key else "?"
     else:
         n_div = "?"
     
     print(f"  Divergences: {n_div}")
     
     # R-hat and ESS from the summary
-    if results_v2["coefficient_summary"] is not None:
-        summary_df = results_v2["coefficient_summary"]
+    if results["coefficient_summary"] is not None:
+        summary_df = results["coefficient_summary"]
         if "r_hat" in summary_df.columns:
             max_rhat = summary_df["r_hat"].max()
             print(f"  Max r̂: {max_rhat:.3f} (should be ≤1.01)")
@@ -1028,4 +931,4 @@ if __name__ == "__main__":
             min_ess = summary_df["ess_bulk"].min()
             print(f"  Min ESS (bulk): {min_ess:.0f} (should be >400)")
     
-    print("\n✅ Diagnostic comparison complete.")
+    print("\n✅ Causal model analysis complete.")

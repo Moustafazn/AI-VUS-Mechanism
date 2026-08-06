@@ -1,11 +1,11 @@
 """
-SpliceVarMech — Diffusion Model Sampling & Mechanism Classification
+SpliceVarMech — Biological Diffusion Model Sampling & Mechanism Classification
 
-Inference pipeline for the trained diffusion model:
-  1. Generate N mRNA samples from pre-mRNA context (with variant)
+Inference pipeline for the BiologicalDiffusionModel:
+  1. Generate N mRNA samples from (WT_context, MUT_context) pair
   2. Classify each sample's splice outcome (normal, exon skipping, etc.)
   3. Compute outcome distribution (aberrant fraction, mechanism probabilities)
-  4. Align generated sequences to wild-type for mechanism identification
+  4. Compare WT vs MUT generation (counterfactual analysis)
 
 This module answers: WHAT happens to the mRNA when this variant is present?
 """
@@ -20,9 +20,10 @@ import numpy as np
 import torch
 
 from src.diffusion.model import (
-    SpliceDiffusionModel,
+    BiologicalDiffusionModel,
     DiffusionConfig,
     VOCAB,
+    TISSUE_TYPES,
     tokenize_sequence,
     detokenize_sequence,
 )
@@ -35,12 +36,11 @@ from src.diffusion.model import (
 @dataclass
 class SpliceOutcome:
     """Classification of a single generated mRNA's splice outcome."""
-    mechanism: str          # "normal", "exon_skipping", "intron_retention",
-                           #  "partial_deletion", "cryptic_site", "complex"
-    confidence: float       # 0-1 confidence in classification
-    generated_seq: str      # The generated mRNA sequence
-    length_ratio: float     # len(generated) / len(wildtype)
-    detail: str = ""        # Additional detail about the mechanism
+    mechanism: str
+    confidence: float
+    generated_seq: str
+    length_ratio: float
+    detail: str = ""
 
 
 @dataclass
@@ -48,22 +48,118 @@ class OutcomeDistribution:
     """Distribution over splice outcomes from N samples."""
     n_samples: int
     outcomes: list[SpliceOutcome]
-
-    # Mechanism counts
     mechanism_counts: dict[str, int] = field(default_factory=dict)
-
-    # Summary statistics
-    aberrant_fraction: float = 0.0      # Fraction of non-normal outcomes
-    dominant_mechanism: str = "unknown"  # Most common mechanism
-    dominant_fraction: float = 0.0      # Fraction of dominant mechanism
-
-    # Per-mechanism probabilities
+    aberrant_fraction: float = 0.0
+    dominant_mechanism: str = "unknown"
+    dominant_fraction: float = 0.0
     p_normal: float = 0.0
     p_exon_skipping: float = 0.0
     p_intron_retention: float = 0.0
     p_partial_deletion: float = 0.0
     p_cryptic_site: float = 0.0
     p_complex: float = 0.0
+
+
+def _needleman_wunsch(seq1: str, seq2: str, match: int = 2, mismatch: int = -1,
+                       gap: int = -2) -> tuple[str, str, int]:
+    """Needleman-Wunsch global alignment."""
+    n, m = len(seq1), len(seq2)
+    if n > 2000:
+        seq1 = seq1[:2000]
+        n = 2000
+    if m > 2000:
+        seq2 = seq2[:2000]
+        m = 2000
+
+    score = np.zeros((n + 1, m + 1), dtype=np.int32)
+    for i in range(1, n + 1):
+        score[i, 0] = gap * i
+    for j in range(1, m + 1):
+        score[0, j] = gap * j
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            s = match if seq1[i - 1] == seq2[j - 1] else mismatch
+            score[i, j] = max(
+                score[i - 1, j - 1] + s,
+                score[i - 1, j] + gap,
+                score[i, j - 1] + gap,
+            )
+
+    aligned1, aligned2 = [], []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            s = match if seq1[i - 1] == seq2[j - 1] else mismatch
+            if score[i, j] == score[i - 1, j - 1] + s:
+                aligned1.append(seq1[i - 1])
+                aligned2.append(seq2[j - 1])
+                i -= 1
+                j -= 1
+                continue
+        if i > 0 and score[i, j] == score[i - 1, j] + gap:
+            aligned1.append(seq1[i - 1])
+            aligned2.append("-")
+            i -= 1
+        else:
+            aligned1.append("-")
+            aligned2.append(seq2[j - 1])
+            j -= 1
+
+    return "".join(reversed(aligned1)), "".join(reversed(aligned2)), int(score[n, m])
+
+
+def _compute_alignment_stats(aln_gen: str, aln_wt: str) -> dict:
+    """Compute alignment statistics."""
+    matches = mismatches = gap_in_gen = gap_in_wt = 0
+    gap_blocks_gen = gap_blocks_wt = 0
+    in_gap_gen = in_gap_wt = False
+    max_gap_gen = max_gap_wt = cur_gap_gen = cur_gap_wt = 0
+
+    for a, b in zip(aln_gen, aln_wt):
+        if a == "-":
+            gap_in_gen += 1
+            cur_gap_gen += 1
+            if not in_gap_gen:
+                gap_blocks_gen += 1
+                in_gap_gen = True
+            in_gap_wt = False
+            max_gap_wt = max(max_gap_wt, cur_gap_wt)
+            cur_gap_wt = 0
+        elif b == "-":
+            gap_in_wt += 1
+            cur_gap_wt += 1
+            if not in_gap_wt:
+                gap_blocks_wt += 1
+                in_gap_wt = True
+            in_gap_gen = False
+            max_gap_gen = max(max_gap_gen, cur_gap_gen)
+            cur_gap_gen = 0
+        else:
+            if a == b:
+                matches += 1
+            else:
+                mismatches += 1
+            max_gap_gen = max(max_gap_gen, cur_gap_gen)
+            max_gap_wt = max(max_gap_wt, cur_gap_wt)
+            cur_gap_gen = cur_gap_wt = 0
+            in_gap_gen = in_gap_wt = False
+
+    max_gap_gen = max(max_gap_gen, cur_gap_gen)
+    max_gap_wt = max(max_gap_wt, cur_gap_wt)
+
+    return {
+        "matches": matches,
+        "mismatches": mismatches,
+        "gap_in_gen": gap_in_gen,
+        "gap_in_wt": gap_in_wt,
+        "gap_blocks_gen": gap_blocks_gen,
+        "gap_blocks_wt": gap_blocks_wt,
+        "max_gap_gen": max_gap_gen,
+        "max_gap_wt": max_gap_wt,
+        "identity": matches / max(matches + mismatches, 1),
+        "alignment_length": len(aln_gen),
+    }
 
 
 def classify_splice_outcome(
@@ -73,96 +169,90 @@ def classify_splice_outcome(
     length_tolerance: float = 0.1,
 ) -> SpliceOutcome:
     """
-    Classify the splice outcome of a generated mRNA by comparing to wild-type.
+    Classify splice outcome by aligning generated mRNA to wild-type.
 
-    Classification logic:
-    1. Similar length to wild-type → normal splicing
-    2. Much shorter → exon skipping or partial deletion
-    3. Much longer → intron retention
-    4. Intermediate → complex or cryptic site
-
-    Args:
-        generated: Generated mRNA sequence
-        wildtype: Expected wild-type mRNA sequence
-        context: Pre-mRNA context (for reference)
-        length_tolerance: Fraction deviation from WT length to count as "normal"
+    Alignment-based logic:
+    1. High identity, no large gaps → normal
+    2. Large deletions → exon skipping / partial deletion
+    3. Large insertions → intron retention
+    4. Low identity → cryptic splice site
     """
-    gen_len = len(generated.replace("PAD", "").replace("MASK", "").strip())
-    wt_len = len(wildtype) if wildtype else 1
+    gen_clean = "".join(c for c in generated if c in "ACGT")
+    wt_clean = "".join(c for c in wildtype if c in "ACGT") if wildtype else ""
+
+    gen_len = len(gen_clean)
+    wt_len = len(wt_clean) if wt_clean else 1
 
     if gen_len == 0:
-        return SpliceOutcome(
-            mechanism="unknown", confidence=0.0,
-            generated_seq=generated, length_ratio=0.0,
-            detail="Empty generated sequence",
-        )
+        return SpliceOutcome("unknown", 0.0, generated, 0.0, "Empty sequence")
 
     length_ratio = gen_len / wt_len
 
-    # Compute sequence similarity (fraction of matching characters)
-    min_len = min(gen_len, wt_len)
-    if min_len > 0 and wildtype:
-        matches = sum(1 for a, b in zip(generated[:min_len], wildtype[:min_len]) if a == b)
-        similarity = matches / min_len
-    else:
-        similarity = 0.0
+    if wt_len < 5:
+        return SpliceOutcome("unknown", 0.0, generated, length_ratio, "WT too short")
 
-    # Classification rules
-    if abs(length_ratio - 1.0) <= length_tolerance and similarity > 0.8:
-        return SpliceOutcome(
-            mechanism="normal", confidence=similarity,
-            generated_seq=generated, length_ratio=length_ratio,
-            detail=f"Length ratio={length_ratio:.2f}, similarity={similarity:.2f}",
-        )
-    elif length_ratio < (1.0 - length_tolerance):
-        # Shorter than expected → exon skipping or partial deletion
-        loss_fraction = 1.0 - length_ratio
-        if loss_fraction > 0.3:
-            return SpliceOutcome(
-                mechanism="exon_skipping", confidence=0.7 + 0.3 * loss_fraction,
-                generated_seq=generated, length_ratio=length_ratio,
-                detail=f"Lost {loss_fraction:.0%} of expected length",
-            )
-        else:
-            return SpliceOutcome(
-                mechanism="partial_deletion", confidence=0.6 + 0.3 * loss_fraction,
-                generated_seq=generated, length_ratio=length_ratio,
-                detail=f"Partial loss: {loss_fraction:.0%} of expected length",
-            )
-    elif length_ratio > (1.0 + length_tolerance):
-        # Longer than expected → intron retention
-        gain_fraction = length_ratio - 1.0
-        return SpliceOutcome(
-            mechanism="intron_retention", confidence=0.6 + 0.3 * min(gain_fraction, 1.0),
-            generated_seq=generated, length_ratio=length_ratio,
-            detail=f"Gained {gain_fraction:.0%} extra sequence (likely retained intron)",
-        )
-    else:
-        # Near-normal length but low similarity → cryptic splice site
-        return SpliceOutcome(
-            mechanism="cryptic_site" if similarity < 0.7 else "normal",
-            confidence=max(0.5, 1.0 - similarity),
-            generated_seq=generated, length_ratio=length_ratio,
-            detail=f"Length ratio={length_ratio:.2f}, similarity={similarity:.2f}",
-        )
+    aln_gen, aln_wt, _ = _needleman_wunsch(gen_clean, wt_clean)
+    stats = _compute_alignment_stats(aln_gen, aln_wt)
+
+    identity = stats["identity"]
+    del_frac = stats["gap_in_gen"] / wt_len
+    ins_frac = stats["gap_in_wt"] / wt_len
+    max_del = stats["max_gap_gen"]
+    max_ins = stats["max_gap_wt"]
+
+    detail = (f"identity={identity:.2f}, del={del_frac:.0%}, ins={ins_frac:.0%}, "
+              f"max_del={max_del}bp, max_ins={max_ins}bp, len_ratio={length_ratio:.2f}")
+
+    # Classification
+    if identity > 0.85 and del_frac < 0.05 and ins_frac < 0.05:
+        return SpliceOutcome("normal", identity, generated, length_ratio, detail)
+
+    if del_frac > 0.10 and ins_frac > 0.10:
+        conf = min(0.9, 0.5 + del_frac + ins_frac)
+        return SpliceOutcome("complex", conf, generated, length_ratio, detail)
+
+    if max_del > 50 or del_frac > 0.30:
+        conf = min(0.98, 0.65 + 0.3 * del_frac)
+        return SpliceOutcome("exon_skipping", conf, generated, length_ratio, detail)
+
+    if del_frac > 0.05 and max_del > 10:
+        conf = min(0.90, 0.55 + 0.4 * del_frac)
+        return SpliceOutcome("partial_deletion", conf, generated, length_ratio, detail)
+
+    if max_ins > 20 or ins_frac > 0.10:
+        conf = min(0.95, 0.55 + 0.4 * ins_frac)
+        return SpliceOutcome("intron_retention", conf, generated, length_ratio, detail)
+
+    if identity < 0.70:
+        return SpliceOutcome("cryptic_site", max(0.5, 1.0 - identity),
+                             generated, length_ratio, detail)
+
+    if identity > 0.70:
+        return SpliceOutcome("normal", identity, generated, length_ratio,
+                             detail + " [borderline]")
+
+    return SpliceOutcome("unknown", 0.3, generated, length_ratio, detail)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Multi-sample generation and analysis
+# Sampler
 # ──────────────────────────────────────────────────────────────────────
-
 
 class SpliceSampler:
     """
-    Generate multiple mRNA samples and analyze the outcome distribution.
+    Generate mRNA samples using the BiologicalDiffusionModel and
+    analyze splice outcome distributions.
 
-    This is the core inference engine: given a pre-mRNA context (with variant),
-    generate N predicted mRNAs and classify each one to estimate the
-    probability distribution over splice outcomes.
+    The key difference from the old sampler: this takes BOTH WT and MUT
+    contexts, enabling the dual-stream comparison that makes the model
+    sensitive to single-nucleotide variants.
     """
 
-    def __init__(self, model: SpliceDiffusionModel, device: str = "cpu"):
+    def __init__(self, model: BiologicalDiffusionModel, device: str = ""):
         self.model = model
+        if not device:
+            from src.config import get_device
+            device = get_device()
         self.device = torch.device(device)
         self.model.to(self.device)
         self.model.eval()
@@ -170,90 +260,105 @@ class SpliceSampler:
     @torch.no_grad()
     def generate_samples(
         self,
-        pre_mrna_context: str,
+        wt_context: str,
+        mut_context: str,
+        variant_pos: int,
+        ref_allele: str = "G",
+        alt_allele: str = "T",
         n_samples: int = 100,
         seq_len: int = 256,
         temperature: float = 1.0,
         batch_size: int = 10,
+        tissue: str = "universal",
     ) -> list[str]:
         """
-        Generate N mRNA samples from a pre-mRNA context.
+        Generate N mRNA samples from a (WT, MUT) context pair.
 
         Args:
-            pre_mrna_context: The pre-mRNA sequence with variant (±200bp)
-            n_samples: Number of mRNA samples to generate
-            seq_len: Length of generated sequences
-            temperature: Sampling temperature (higher = more diverse)
+            wt_context: Wild-type pre-mRNA sequence
+            mut_context: Mutant pre-mRNA sequence
+            variant_pos: Position of variant in context
+            ref_allele: Reference nucleotide
+            alt_allele: Alternate nucleotide
+            n_samples: Number of samples to generate
+            seq_len: Length of generated mRNA
+            temperature: Sampling temperature
             batch_size: Batch size for parallel generation
+            tissue: Tissue type name
 
         Returns:
             List of generated mRNA sequences
         """
-        context_tokens = tokenize_sequence(
-            pre_mrna_context, max_len=self.model.config.max_seq_len
-        ).to(self.device)
+        max_len = self.model.config.max_seq_len
+        wt_tokens = tokenize_sequence(wt_context, max_len).to(self.device)
+        mut_tokens = tokenize_sequence(mut_context, max_len).to(self.device)
+        vpos = torch.tensor(min(variant_pos, max_len - 1), dtype=torch.long, device=self.device)
+        ref_tok = torch.tensor(VOCAB.get(ref_allele.upper(), 1), dtype=torch.long, device=self.device)
+        alt_tok = torch.tensor(VOCAB.get(alt_allele.upper(), 1), dtype=torch.long, device=self.device)
+        tissue_idx = TISSUE_TYPES.get(tissue.lower(), 0)
 
-        generated_sequences = []
+        generated = []
         n_batches = (n_samples + batch_size - 1) // batch_size
 
-        for batch_idx in range(n_batches):
-            curr_batch_size = min(batch_size, n_samples - len(generated_sequences))
-            # Expand context for batch
-            ctx_batch = context_tokens.unsqueeze(0).expand(curr_batch_size, -1)
+        for _ in range(n_batches):
+            curr_bs = min(batch_size, n_samples - len(generated))
+            wt_batch = wt_tokens.unsqueeze(0).expand(curr_bs, -1)
+            mut_batch = mut_tokens.unsqueeze(0).expand(curr_bs, -1)
+            vpos_batch = vpos.unsqueeze(0).expand(curr_bs)
+            ref_batch = ref_tok.unsqueeze(0).expand(curr_bs)
+            alt_batch = alt_tok.unsqueeze(0).expand(curr_bs)
+            tissue_batch = torch.full((curr_bs,), tissue_idx, dtype=torch.long, device=self.device)
 
-            # Generate
             output_tokens = self.model.sample(
-                ctx_batch,
+                wt_context=wt_batch,
+                mut_context=mut_batch,
+                variant_pos=vpos_batch,
                 seq_len=seq_len,
                 temperature=temperature,
+                ref_token=ref_batch,
+                alt_token=alt_batch,
+                tissue_id=tissue_batch,
             )
 
-            # Detokenize
-            for i in range(curr_batch_size):
-                seq = detokenize_sequence(output_tokens[i])
-                generated_sequences.append(seq)
+            for i in range(curr_bs):
+                generated.append(detokenize_sequence(output_tokens[i]))
 
-        return generated_sequences[:n_samples]
+        return generated[:n_samples]
 
     def analyze_outcomes(
         self,
-        pre_mrna_context: str,
+        wt_context: str,
+        mut_context: str,
+        variant_pos: int,
         wildtype_mrna: str,
+        ref_allele: str = "G",
+        alt_allele: str = "T",
         n_samples: int = 100,
         seq_len: int = 256,
         temperature: float = 1.0,
         batch_size: int = 10,
     ) -> OutcomeDistribution:
-        """
-        Generate samples and classify their splice outcomes.
-
-        Returns:
-            OutcomeDistribution with mechanism probabilities and statistics
-        """
-        # Generate samples
+        """Generate samples and classify their splice outcomes."""
         generated = self.generate_samples(
-            pre_mrna_context=pre_mrna_context,
+            wt_context=wt_context,
+            mut_context=mut_context,
+            variant_pos=variant_pos,
+            ref_allele=ref_allele,
+            alt_allele=alt_allele,
             n_samples=n_samples,
             seq_len=seq_len,
             temperature=temperature,
             batch_size=batch_size,
         )
 
-        # Classify each sample
-        outcomes = []
-        for seq in generated:
-            outcome = classify_splice_outcome(
-                generated=seq,
-                wildtype=wildtype_mrna,
-                context=pre_mrna_context,
-            )
-            outcomes.append(outcome)
+        outcomes = [
+            classify_splice_outcome(seq, wildtype_mrna, mut_context)
+            for seq in generated
+        ]
 
-        # Count mechanisms
         mech_counts = Counter(o.mechanism for o in outcomes)
         total = len(outcomes)
 
-        # Compute probabilities
         dist = OutcomeDistribution(
             n_samples=total,
             outcomes=outcomes,
@@ -267,49 +372,57 @@ class SpliceSampler:
             p_complex=mech_counts.get("complex", 0) / total if total > 0 else 0.0,
         )
 
-        # Determine dominant mechanism
         if mech_counts:
-            dominant = mech_counts.most_common(1)[0]
-            dist.dominant_mechanism = dominant[0]
-            dist.dominant_fraction = dominant[1] / total if total > 0 else 0.0
-        else:
-            dist.dominant_mechanism = "unknown"
-            dist.dominant_fraction = 0.0
+            dom = mech_counts.most_common(1)[0]
+            dist.dominant_mechanism = dom[0]
+            dist.dominant_fraction = dom[1] / total if total > 0 else 0.0
 
         return dist
 
     def compare_wildtype_vs_mutant(
         self,
-        wildtype_context: str,
-        mutant_context: str,
+        wt_context: str,
+        mut_context: str,
+        variant_pos: int,
         expected_mrna: str,
+        ref_allele: str = "G",
+        alt_allele: str = "T",
         n_samples: int = 50,
         seq_len: int = 256,
         temperature: float = 1.0,
     ) -> dict:
         """
-        Compare diffusion outputs between wild-type and mutant contexts.
+        Counterfactual comparison: generate from WT context vs MUT context.
 
-        This implements the counterfactual comparison:
-        - Generate from WT context → should produce normal mRNA
-        - Generate from mutant context → may produce aberrant mRNA
-        - The difference IS the causal effect of the variant
-
-        Returns dict with both distributions and comparison metrics.
+        WT context uses WT for both streams → no variant effect (baseline).
+        MUT context uses real WT vs MUT → variant effect visible.
         """
-        print("  Generating wild-type samples...")
+        print("  Generating wild-type baseline samples...")
         wt_dist = self.analyze_outcomes(
-            wildtype_context, expected_mrna,
-            n_samples=n_samples, seq_len=seq_len, temperature=temperature,
+            wt_context=wt_context,
+            mut_context=wt_context,  # WT vs WT = no variant
+            variant_pos=variant_pos,
+            wildtype_mrna=expected_mrna,
+            ref_allele=ref_allele,
+            alt_allele=ref_allele,  # Same allele = no change
+            n_samples=n_samples,
+            seq_len=seq_len,
+            temperature=temperature,
         )
 
         print("  Generating mutant samples...")
         mut_dist = self.analyze_outcomes(
-            mutant_context, expected_mrna,
-            n_samples=n_samples, seq_len=seq_len, temperature=temperature,
+            wt_context=wt_context,
+            mut_context=mut_context,
+            variant_pos=variant_pos,
+            wildtype_mrna=expected_mrna,
+            ref_allele=ref_allele,
+            alt_allele=alt_allele,
+            n_samples=n_samples,
+            seq_len=seq_len,
+            temperature=temperature,
         )
 
-        # Causal effect: difference in aberrant fraction
         causal_effect = mut_dist.aberrant_fraction - wt_dist.aberrant_fraction
 
         return {
@@ -325,84 +438,12 @@ class SpliceSampler:
 
 def print_outcome_distribution(dist: OutcomeDistribution, label: str = ""):
     """Pretty-print an outcome distribution."""
-    if label:
-        print(f"\n  [{label}] Outcome Distribution ({dist.n_samples} samples):")
-    else:
-        print(f"\n  Outcome Distribution ({dist.n_samples} samples):")
-
+    header = f"  [{label}] " if label else "  "
+    print(f"\n{header}Outcome Distribution ({dist.n_samples} samples):")
     print(f"    Aberrant fraction: {dist.aberrant_fraction:.1%}")
     print(f"    Dominant mechanism: {dist.dominant_mechanism} ({dist.dominant_fraction:.1%})")
-    print(f"    Mechanism breakdown:")
+    print(f"    Breakdown:")
     for mech, count in sorted(dist.mechanism_counts.items(), key=lambda x: -x[1]):
         pct = count / dist.n_samples * 100
         bar = "█" * int(pct / 2)
         print(f"      {mech:25s} {count:4d} ({pct:5.1f}%) {bar}")
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Convenience: run sampling directly
-# ──────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    from src.diffusion.training import generate_splice_junction, generate_variant_effect
-
-    print("=" * 70)
-    print("DIFFUSION MODEL SAMPLING & MECHANISM CLASSIFICATION")
-    print("=" * 70)
-
-    # Create a small model for demonstration
-    config = DiffusionConfig(
-        max_seq_len=128,
-        d_model=64,
-        n_heads=4,
-        n_layers=2,
-        d_ff=256,
-        n_timesteps=20,
-    )
-    model = SpliceDiffusionModel(config)
-    print(f"Model parameters: {model.get_num_params():,}")
-
-    sampler = SpliceSampler(model, device="cpu")
-
-    # Demo 1: Normal splice junction
-    print("\n--- Demo 1: Normal Splice Junction ---")
-    pre_mrna, wt_mrna = generate_splice_junction(60, 100, 60)
-    print(f"  Pre-mRNA length: {len(pre_mrna)}")
-    print(f"  Expected mRNA length: {len(wt_mrna)}")
-
-    dist_normal = sampler.analyze_outcomes(
-        pre_mrna_context=pre_mrna,
-        wildtype_mrna=wt_mrna,
-        n_samples=20,
-        seq_len=128,
-    )
-    print_outcome_distribution(dist_normal, "Normal Junction")
-
-    # Demo 2: Variant causing exon skipping
-    print("\n--- Demo 2: Variant → Exon Skipping ---")
-    mut_pre, aberrant, effect = generate_variant_effect(60, 100, 60, "exon_skipping")
-    print(f"  Mutant pre-mRNA length: {len(mut_pre)}")
-    print(f"  Aberrant mRNA length: {len(aberrant)}")
-
-    dist_skip = sampler.analyze_outcomes(
-        pre_mrna_context=mut_pre,
-        wildtype_mrna=wt_mrna,
-        n_samples=20,
-        seq_len=128,
-    )
-    print_outcome_distribution(dist_skip, "Exon Skipping Variant")
-
-    # Demo 3: Wild-type vs Mutant comparison
-    print("\n--- Demo 3: Wild-type vs Mutant Comparison ---")
-    comparison = sampler.compare_wildtype_vs_mutant(
-        wildtype_context=pre_mrna,
-        mutant_context=mut_pre,
-        expected_mrna=wt_mrna,
-        n_samples=10,
-        seq_len=128,
-    )
-    print(f"  WT aberrant fraction: {comparison['wt_aberrant_fraction']:.1%}")
-    print(f"  MUT aberrant fraction: {comparison['mut_aberrant_fraction']:.1%}")
-    print(f"  Causal effect: {comparison['causal_effect']:+.1%}")
-
-    print("\n✅ Sampling & classification demo complete")

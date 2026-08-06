@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from src.diffusion.model import (
-    SpliceDiffusionModel,
+    BiologicalDiffusionModel,
     DiffusionConfig,
     VOCAB,
     tokenize_sequence,
@@ -97,20 +97,24 @@ class XAIReport:
 
 
 def compute_attention_attribution(
-    model: SpliceDiffusionModel,
+    model: BiologicalDiffusionModel,
     context_seq: str,
     target_seq: str,
     max_len: int = 256,
 ) -> SequenceAttribution:
     """
-    Compute attribution scores using attention weights from the transformer.
+    Compute attribution scores using true cross-attention weights from the
+    transformer decoder layers.
 
-    The cross-attention weights between the context encoder and the decoder
-    reveal which positions in the pre-mRNA context most influence the
-    generated output. Higher attention = more important for the prediction.
+    The decoder's multihead cross-attention attends to the context encoder
+    output. We extract the actual attention weight matrices from every
+    decoder layer, average across layers and heads, and then aggregate
+    over target positions to obtain per-context-position importance.
 
-    This is a model-agnostic approximation: we average attention across
-    all heads and layers to get per-position importance.
+    Higher aggregated attention = the model relies more on that context
+    position when generating the output.
+
+    Reference: Abnar & Zuidema, "Quantifying Attention Flow", ACL 2020.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -124,51 +128,65 @@ def compute_attention_attribution(
     # Corrupt target to get x_t
     x_t = model.noise_schedule.corrupt(tgt_tokens, t)
 
-    # Forward pass to get attention weights
-    # We'll use hooks to capture cross-attention weights
-    attention_maps = []
+    # ── Extract true cross-attention weights ──
+    # PyTorch's nn.MultiheadAttention returns (attn_output, attn_weights)
+    # when average_attn_weights=True (default). We hook into the
+    # cross-attention sub-module of each decoder layer.
+    cross_attn_weights: list[torch.Tensor] = []
 
-    def _attention_hook(module, input, output):
-        # TransformerDecoderLayer stores attention weights internally
-        # We capture the output which includes attended values
-        if hasattr(output, 'shape') and len(output.shape) == 3:
-            # Compute attention from the decoder layer's multihead attention
-            attention_maps.append(output.detach().cpu())
+    def _make_cross_attn_hook():
+        """Create a hook that captures cross-attention weight matrices."""
+        def _hook(module, args, output):
+            # nn.MultiheadAttention.forward returns (attn_output, attn_weights)
+            if isinstance(output, tuple) and len(output) >= 2:
+                weights = output[1]  # [batch, tgt_len, src_len]
+                if weights is not None:
+                    cross_attn_weights.append(weights.detach().cpu())
+        return _hook
 
-    # Register hooks on decoder layers
+    # Register hooks on the cross-attention (multihead_attn) of each decoder layer
     hooks = []
-    for layer in model.transformer.decoder.layers:
-        hook = layer.register_forward_hook(_attention_hook)
-        hooks.append(hook)
+    for layer in model.decoder.layers:
+        if hasattr(layer, 'multihead_attn'):
+            hook = layer.multihead_attn.register_forward_hook(_make_cross_attn_hook())
+            hooks.append(hook)
 
     with torch.no_grad():
-        logits = model.transformer(x_t, t, ctx_tokens)
+        # BiologicalDiffusionModel needs WT + MUT contexts.
+        # For attribution, use same context as both WT and MUT.
+        dummy_var_pos = torch.tensor([0], device=device)
+        dummy_ref = torch.tensor([VOCAB.get("G", 3)], device=device)
+        dummy_alt = torch.tensor([VOCAB.get("G", 3)], device=device)
+        fused_context, _ = model.encode_context(
+            wt_context=ctx_tokens, mut_context=ctx_tokens,
+            variant_pos=dummy_var_pos, ref_token=dummy_ref, alt_token=dummy_alt,
+        )
+        logits = model.decode_step(x_t, t, fused_context)
 
     # Remove hooks
     for h in hooks:
         h.remove()
 
-    # Compute approximate attribution from the logits
-    # Use the gradient of the loss w.r.t. the context embedding as attribution
-    # Since we want a no-grad approximation, we use softmax entropy reduction
-    probs = F.softmax(logits, dim=-1)  # [1, seq_len, vocab_size]
-    entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)  # [1, seq_len]
+    # ── Aggregate attention weights into per-context-position importance ──
+    if cross_attn_weights:
+        # Stack all layers: [n_layers, batch, tgt_len, ctx_len]
+        stacked = torch.stack(cross_attn_weights, dim=0)
+        # Average over layers and batch dim → [tgt_len, ctx_len]
+        avg_attn = stacked.mean(dim=(0, 1))
+        # Sum over target positions → importance of each context position
+        ctx_importance = avg_attn.sum(dim=0).numpy()  # [ctx_len]
+    else:
+        # Fallback: gradient-based attribution if hooks didn't capture weights
+        # (can happen depending on PyTorch version or need_weights setting)
+        ctx_importance = _gradient_context_fallback(
+            model, ctx_tokens, tgt_tokens, x_t, t, max_len
+        )
 
-    # Low entropy positions = high confidence predictions = important
-    confidence = 1.0 - (entropy / np.log(model.config.vocab_size))
-    confidence = confidence.squeeze(0).cpu().numpy()
-
-    # For context attribution, use the embedding magnitudes as proxy
-    with torch.no_grad():
-        ctx_emb = model.transformer.context_emb(ctx_tokens)
-        ctx_emb = model.transformer.context_pos(ctx_emb)
-        ctx_encoded = model.transformer.context_encoder(ctx_emb)
-
-    # L2 norm of encoded context as importance proxy
-    ctx_importance = ctx_encoded.norm(dim=-1).squeeze(0).cpu().numpy()
     # Normalize to [0, 1]
     if ctx_importance.max() > ctx_importance.min():
-        ctx_importance = (ctx_importance - ctx_importance.min()) / (ctx_importance.max() - ctx_importance.min())
+        ctx_importance = (ctx_importance - ctx_importance.min()) / (
+            ctx_importance.max() - ctx_importance.min()
+        )
 
     # Find top positions
     n_top = min(10, len(ctx_importance))
@@ -182,13 +200,62 @@ def compute_attention_attribution(
         motif = context_seq[start:end]
         top_motifs.append(f"pos {idx}: {motif}")
 
+    method = "cross_attention" if cross_attn_weights else "gradient_fallback"
+
     return SequenceAttribution(
         sequence=context_seq,
         attribution_scores=ctx_importance,
-        method="attention_embedding",
+        method=method,
         top_positions=top_idx.tolist(),
         top_motifs=top_motifs,
     )
+
+
+def _gradient_context_fallback(
+    model: BiologicalDiffusionModel,
+    ctx_tokens: torch.Tensor,
+    tgt_tokens: torch.Tensor,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    max_len: int,
+) -> np.ndarray:
+    """
+    Fallback attribution via gradient of loss w.r.t. context embeddings.
+    Used when cross-attention hooks don't capture weights.
+
+    Adapted for BiologicalDiffusionModel architecture:
+    token_emb → pos_enc → multi_scale → dual_stream → decoder → output_proj
+    """
+    # Embed context and enable gradients
+    ctx_emb = model.token_emb(ctx_tokens)
+    ctx_emb = model.pos_enc(ctx_emb)
+    ctx_emb = ctx_emb.detach().requires_grad_(True)
+
+    # Process through multi-scale and dual-stream (using same ctx as WT and MUT)
+    ctx_ms = model.multi_scale(ctx_emb)
+    fused, _ = model.dual_stream(ctx_ms, ctx_ms)
+
+    # Decode
+    x_emb = model.pos_enc(model.token_emb(x_t))
+    x_emb = x_emb + model.time_emb(t).unsqueeze(1)
+    decoded = model.decoder(x_emb, fused)
+    decoded = model.output_norm(decoded)
+    logits = model.output_proj(decoded)
+
+    mask = (x_t == VOCAB["MASK"])
+    if mask.any():
+        loss = F.cross_entropy(logits[mask], tgt_tokens[mask])
+    else:
+        loss = logits.mean()
+    loss.backward()
+
+    if ctx_emb.grad is not None:
+        grad_attr = ctx_emb.grad.norm(dim=-1).squeeze(0).detach().cpu().numpy()
+    else:
+        grad_attr = np.zeros(max_len)
+
+    model.zero_grad()
+    return grad_attr
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -197,7 +264,7 @@ def compute_attention_attribution(
 
 
 def compute_gradient_attribution(
-    model: SpliceDiffusionModel,
+    model: BiologicalDiffusionModel,
     context_seq: str,
     target_seq: str,
     max_len: int = 256,
@@ -222,23 +289,22 @@ def compute_gradient_attribution(
     t = torch.tensor([model.config.n_timesteps // 2], device=device)
     x_t = model.noise_schedule.corrupt(tgt_tokens, t)
 
-    # Enable gradients for the embedding
-    ctx_emb = model.transformer.context_emb(ctx_tokens)
-    ctx_emb.requires_grad_(True)
+    # Enable gradients for the context embedding
+    ctx_emb = model.token_emb(ctx_tokens)
+    ctx_emb = model.pos_enc(ctx_emb)
+    ctx_emb = ctx_emb.detach().requires_grad_(True)
 
-    # Forward through context encoder
-    ctx_pos = model.transformer.context_pos(ctx_emb)
-    ctx_encoded = model.transformer.context_encoder(ctx_pos)
+    # Forward through multi-scale + dual-stream encoder (same ctx as WT and MUT)
+    ctx_ms = model.multi_scale(ctx_emb)
+    fused, _ = model.dual_stream(ctx_ms, ctx_ms)
 
     # Forward through decoder
-    x_emb = model.transformer.token_emb(x_t)
-    x_emb = model.transformer.pos_enc(x_emb)
-    t_emb = model.transformer.time_emb(t)
-    x_emb = x_emb + t_emb.unsqueeze(1)
+    x_emb = model.pos_enc(model.token_emb(x_t))
+    x_emb = x_emb + model.time_emb(t).unsqueeze(1)
 
-    decoded = model.transformer.decoder(x_emb, ctx_encoded)
-    decoded = model.transformer.norm(decoded)
-    logits = model.transformer.output_proj(decoded)
+    decoded = model.decoder(x_emb, fused)
+    decoded = model.output_norm(decoded)
+    logits = model.output_proj(decoded)
 
     # Compute loss on masked positions
     mask = (x_t == VOCAB["MASK"])
@@ -518,7 +584,7 @@ def grade_confidence(
 
 
 def run_xai_analysis(
-    model: SpliceDiffusionModel,
+    model: BiologicalDiffusionModel,
     context_seq: str,
     target_seq: str,
     variant: str = "c.1156+16G>T",
@@ -641,33 +707,3 @@ def format_attribution_heatmap(attribution: SequenceAttribution, width: int = 60
     return "\n".join(lines)
 
 
-# ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    from src.diffusion.model import SpliceDiffusionModel, DiffusionConfig
-    from src.diffusion.training import _exon_with_ese, _intron_with_consensus
-
-    print("XAI MODULE TEST")
-    print("=" * 70)
-
-    config = DiffusionConfig(
-        max_seq_len=128, d_model=64, n_heads=4, n_layers=2,
-        d_ff=256, n_timesteps=10,
-    )
-    model = SpliceDiffusionModel(config)
-
-    # Create synthetic context
-    exon = _exon_with_ese(60)
-    intron = _intron_with_consensus(60)
-    context = exon + intron + _exon_with_ese(60)
-    target = exon + _exon_with_ese(60)
-
-    report = run_xai_analysis(
-        model=model,
-        context_seq=context[:128],
-        target_seq=target[:128],
-        verbose=True,
-    )
-
-    # Print attribution heatmap
-    print("\n" + format_attribution_heatmap(report.attribution))
-    print("\n✅ XAI module test complete")

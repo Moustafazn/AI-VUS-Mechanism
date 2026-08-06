@@ -4,7 +4,7 @@
 
 ### 1.1 Male Infertility and Spermatogenesis
 
-Male infertility affects approximately 7% of men worldwide, and in roughly 40% of cases the underlying genetic cause remains unidentified — termed **idiopathic male infertility**. The production of mature sperm (spermatogenesis) is one of the most complex differentiation programs in human biology, requiring the coordinated expression of over 2,000 genes across a tightly regulated developmental timeline:
+Male infertility affects approximately 7% of men worldwide, and in roughly 40% of cases the underlying genetic cause remains unidentified — termed **idiopathic male infertility**. The of mature sperm (spermatogenesis) is one of the most complex differentiation programs in human biology, requiring the coordinated expression of over 2,000 genes across a tightly regulated developmental timeline:
 
 1. **Spermatogonial stem cells** undergo mitotic divisions to maintain the progenitor pool
 2. **Primary spermatocytes** enter meiosis I, where homologous chromosomes must pair and undergo recombination (crossover formation) — this step is essential for genetic diversity and correct chromosome segregation
@@ -29,7 +29,7 @@ A 34-year-old male with consanguineous parentage presents with primary infertili
 - **Karyotype:** 46,XY (normal)
 - **Hormone profile:** elevated FSH (consistent with spermatogenic failure)
 - **Testicular biopsy:** meiotic arrest
-- **Whole-exome sequencing:** identified a hemizygous variant in TEX11: **c.1156+16G>T**
+- **Whole-genome sequencing:** identified a hemizygous variant in TEX11: **c.1156+16G>T**
 
 This variant sits at **position +16 within the intron**, downstream of the exon-intron boundary. It is classified as a **Variant of Uncertain Significance (VUS)** because:
 - It falls outside the canonical ±1/±2 splice sites that clinical laboratories routinely evaluate

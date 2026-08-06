@@ -1,6 +1,9 @@
 # SpliceVarMech — Requirements
 # Install with: pip install -r requirements.txt
 
+# ── Configuration ──
+pyyaml>=6.0
+
 # ── Phase 1 & 2: Data parsing, feature extraction ──
 openpyxl>=3.1.0
 pandas>=2.0.0
@@ -14,9 +17,17 @@ scipy>=1.10.0
 # ── Phase 4: Diffusion model (deep learning) ──
 torch>=2.0.0
 einops>=0.7.0
+pyfaidx>=0.7.0              # FASTA access for GENCODE pre-training
 
 # ── Evaluation & baselines ──
 scikit-learn>=1.3.0
+matplotlib>=3.7.0
+
+# ── External data processing ──
+# gnomAD VCF filtering requires system tools (not pip):
+#   brew install bcftools htslib   (macOS)
+#   conda install -c bioconda bcftools htslib  (conda)
+# MFASS data parsing (TSV, included in stdlib csv module — no extra deps)
 
 # ── Testing ──
 pytest>=7.0.0
