@@ -3,8 +3,8 @@ SpliceVarMech — Biological Diffusion Model Training Pipeline
 
 Two-stage training for the BiologicalDiffusionModel:
 
-  Stage 1 — Pre-training on splice junctions WITH simulated variants
-    • Takes real GENCODE junctions (or synthetic fallback)
+  Stage 1 — Pre-training on GENCODE splice junctions WITH simulated variants
+    • Requires real GENCODE GTF + FASTA (no fallback)
     • For EACH junction, creates a paired (WT, MUT) example:
       - Mutate a position near the splice site → MUT context
       - If mutation destroys GT/AG → disruptive (target = aberrant mRNA)
@@ -12,8 +12,8 @@ Two-stage training for the BiologicalDiffusionModel:
     • Model learns: which mutations matter and which don't
 
   Stage 2 — Fine-tuning on gold-standard variant effects
-    • Real WT/MUT pre-mRNA pairs from hg38 reference genome
-    • Real experimental labels (disrupts splicing or not)
+    • WT/MUT pre-mRNA pairs from hg38 reference genome
+    • experimental labels (disrupts splicing or not)
     • Contrastive loss enforces WT/MUT representation separation
 
 All datasets provide: (wt_context, mut_context, variant_pos, ref_token,
@@ -49,13 +49,13 @@ from src.config import get_resource_config, clear_memory_cache
 # Biologically informed sequence generation
 # ──────────────────────────────────────────────────────────────────────
 
-ESE_HEXAMERS = [
-    "GAAGAA", "GGAGGA", "AAGAAG", "GACGAC", "AAGAAC",
-    "GAAGGC", "AGAAGA", "GAAGAG", "AACAAG", "GAAGAT",
-]
-DONOR_CONSENSUS = "GTAAGT"
-ACCEPTOR_CONSENSUS = "AG"
-PYRIMIDINE_TRACT = "TTTTCTTTCC"
+# Load splice motifs from config.yaml
+from src.config import get_splice_motifs as _get_motifs
+_motifs = _get_motifs()
+ESE_HEXAMERS = _motifs["ese_hexamers"]
+DONOR_CONSENSUS = _motifs["donor_consensus"]
+ACCEPTOR_CONSENSUS = _motifs["acceptor_consensus"]
+PYRIMIDINE_TRACT = _motifs["polypyrimidine_tract"]
 
 
 def _random_seq(length: int) -> str:
@@ -350,9 +350,8 @@ class GoldStandardPairedDataset(Dataset):
                     label=1,
                     mechanism=v.mechanism_category,
                 ))
-            elif v.sequence_length > 10:
-                # Synthetic fallback
-                self._add_synthetic_positive(v)
+            else:
+                print(f"  [GoldStandard] ⚠️  Skipping positive {v.gene_variant} — no hg38 context")
 
         # S2 Negatives
         for v in dataset.usable_negatives:
@@ -373,12 +372,23 @@ class GoldStandardPairedDataset(Dataset):
                     mechanism="normal",
                 ))
             else:
-                self._add_synthetic_negative()
+                raise RuntimeError(
+                    f"Cannot load negative variant {v.gene_variant} — "
+                    f"no hg38 context available. Ensure GRCh38 FASTA + GENCODE GTF "
+                    f"exist in data/external/."
+                )
 
-        # MFASS experimentally validated variants (Problem 2: expand gold standard)
+        if len(self.examples) == 0:
+            raise RuntimeError(
+                "No gold-standard variants could be loaded with real hg38 contexts. "
+                "Ensure GRCh38.primary_assembly.genome.fa and gencode.v44.annotation.gtf "
+                "exist in data/external/."
+            )
+
+        # MFASS experimentally validated variants (real labels, require hg38 contexts)
         self._load_mfass_variants()
 
-        # gnomAD benign negatives (Problem 3: fix adversarial negatives)
+        # gnomAD benign negatives (real labels, require hg38 contexts)
         self._load_gnomad_negatives()
 
         print(f"  [GoldStandard] Loaded {len(self.examples)} primary examples")
@@ -407,200 +417,161 @@ class GoldStandardPairedDataset(Dataset):
 
         return ref_allele, alt_allele, var_pos
 
-    def _add_synthetic_positive(self, v):
-        """Add a synthetic positive example."""
-        exon1 = _exon_with_ese(100)
-        intron = _intron_with_consensus(200)
-        exon2 = _exon_with_ese(100)
-        wt = exon1 + intron + exon2
-
-        # Mutate donor site to make it disruptive
-        mut_list = list(wt)
-        var_pos = len(exon1)  # Position of GT donor
-        ref = mut_list[var_pos]
-        alt = random.choice([n for n in "ACGT" if n != ref])
-        mut_list[var_pos] = alt
-        mut = "".join(mut_list)
-
-        mech = v.mechanism_category if hasattr(v, 'mechanism_category') else "exon_skipping"
-        if mech == "intron_retention":
-            target = exon1 + "".join(mut_list[len(exon1):len(exon1)+len(intron)]) + exon2
-        else:
-            target = exon1  # Exon skipping
-
-        self.examples.append(PairedSpliceExample(
-            wt_pre_mrna=wt[:self.ctx_len],
-            mut_pre_mrna=mut[:self.ctx_len],
-            variant_pos=min(var_pos, self.ctx_len - 1),
-            ref_allele=ref,
-            alt_allele=alt,
-            target_mrna=target,
-            label=1,
-            mechanism=mech,
-        ))
-
-    def _add_synthetic_negative(self):
-        """Add a synthetic benign example."""
-        exon1 = _exon_with_ese(100)
-        intron = _intron_with_consensus(200)
-        exon2 = _exon_with_ese(100)
-        wt = exon1 + intron + exon2
-
-        # Mutate an unimportant position (intron body)
-        var_pos = len(exon1) + 20 + random.randint(0, 50)
-        var_pos = min(var_pos, len(wt) - 1)
-        mut_list = list(wt)
-        ref = mut_list[var_pos]
-        alt = random.choice([n for n in "ACGT" if n != ref])
-        mut_list[var_pos] = alt
-
-        self.examples.append(PairedSpliceExample(
-            wt_pre_mrna=wt[:self.ctx_len],
-            mut_pre_mrna="".join(mut_list)[:self.ctx_len],
-            variant_pos=min(var_pos, self.ctx_len - 1),
-            ref_allele=ref,
-            alt_allele=alt,
-            target_mrna=exon1 + exon2,  # Normal splicing
-            label=0,
-            mechanism="normal",
-        ))
-
     def _load_mfass_variants(self):
         """
-        Load MFASS experimentally validated splice variants.
-        
-        FIX for Problem 2: Expand gold standard from N=31 to N=400+.
-        MFASS provides 27,733 variants with real experimental splice outcomes.
-        We sample a balanced subset for training augmentation.
+        Load MFASS experimentally validated splice variants using their
+        built-in minigene sequences (wt_sequence, mut_sequence, wt_mrna).
+
+        MFASS provides 28,972 variants with real experimental splice outcomes
+        AND real minigene construct sequences — no hg38 extraction needed.
+
+        Uses a FIXED training subset (seed=42) to ensure reproducibility
+        and prevent overlap with the evaluation subset.
+        Training IDs are stored in MFASS_TRAINING_IDS for exclusion from eval.
         """
         try:
             from src.data.mfass import load_mfass_variants
+
             mfass = load_mfass_variants(verbose=False)
             if not mfass:
                 return
 
-            # Sample balanced subset (up to 200 pos + 200 neg)
-            positives = [v for v in mfass if v.label == 1][:200]
-            negatives = [v for v in mfass if v.label == 0][:200]
+            # Filter to variants WITH minigene sequences
+            with_seq = [v for v in mfass
+                        if v.wt_sequence and v.mut_sequence and v.wt_mrna
+                        and len(v.wt_sequence) > 50]
+
+            if not with_seq:
+                print("  [GoldStandard] MFASS: no variants with minigene sequences")
+                return
+
+            # Sample balanced subset using FIXED seed for reproducibility
+            import random as _rng
+            _rng.seed(42)
+            pos_all = [v for v in with_seq if v.label == 1]
+            neg_all = [v for v in with_seq if v.label == 0]
+            pos_sample = _rng.sample(pos_all, min(200, len(pos_all)))
+            neg_sample = _rng.sample(neg_all, min(200, len(neg_all)))
+
+            # Store training IDs globally for eval exclusion
+            global _MFASS_TRAINING_IDS
+            _MFASS_TRAINING_IDS = {v.variant_id for v in pos_sample + neg_sample}
 
             n_added = 0
-            for v in positives + negatives:
-                exon1 = _exon_with_ese(random.randint(60, 120))
-                intron = _intron_with_consensus(random.randint(80, 200))
-                exon2 = _exon_with_ese(random.randint(60, 120))
-                wt = exon1 + intron + exon2
+            for v in pos_sample + neg_sample:
+                # Use MFASS minigene sequences directly (no hg38 needed)
+                wt_seq = v.wt_sequence
+                mut_seq = v.mut_sequence
+                wt_mrna = v.wt_mrna
 
-                # Place variant at correct relative position
-                if v.position > 0:  # Donor side
-                    var_pos = len(exon1) + abs(v.position)
-                elif v.position < 0:  # Acceptor side
-                    var_pos = len(exon1) + len(intron) - abs(v.position)
-                else:  # Exonic
-                    var_pos = max(0, len(exon1) - 10 + random.randint(0, 20))
-                var_pos = max(0, min(var_pos, len(wt) - 1))
+                # Find variant position by comparing WT and MUT
+                var_pos = 0
+                for i in range(min(len(wt_seq), len(mut_seq))):
+                    if wt_seq[i] != mut_seq[i]:
+                        var_pos = i
+                        break
 
-                mut_list = list(wt)
-                ref = mut_list[var_pos]
-                alt = v.alt_allele if v.alt_allele in "ACGT" else random.choice([n for n in "ACGT" if n != ref])
-                mut_list[var_pos] = alt
+                ref_allele = wt_seq[var_pos] if var_pos < len(wt_seq) else "N"
+                alt_allele = mut_seq[var_pos] if var_pos < len(mut_seq) else "N"
 
                 if v.label == 1:
-                    # Splice-disrupting: generate aberrant mRNA
-                    if v.region == "intronic_donor":
-                        target = exon1 + "".join(mut_list[len(exon1):len(exon1)+len(intron)]) + exon2
+                    mechanism = v.region
+                    if mechanism == "intronic_donor":
                         mechanism = "intron_retention"
+                    elif mechanism == "intronic_acceptor":
+                        mechanism = "exon_skipping"
                     else:
-                        target = exon1  # Exon skipping
                         mechanism = "exon_skipping"
                 else:
-                    target = exon1 + exon2  # Normal splicing
                     mechanism = "normal"
 
                 self.examples.append(PairedSpliceExample(
-                    wt_pre_mrna=wt[:self.ctx_len],
-                    mut_pre_mrna="".join(mut_list)[:self.ctx_len],
+                    wt_pre_mrna=wt_seq[:self.ctx_len],
+                    mut_pre_mrna=mut_seq[:self.ctx_len],
                     variant_pos=min(var_pos, self.ctx_len - 1),
-                    ref_allele=ref,
-                    alt_allele=alt,
-                    target_mrna=target,
+                    ref_allele=ref_allele,
+                    alt_allele=alt_allele,
+                    target_mrna=wt_mrna if v.label == 0 else wt_seq[:self.target_len],
                     label=v.label,
                     mechanism=mechanism,
                 ))
                 n_added += 1
 
             if n_added > 0:
-                print(f"  [GoldStandard] Added {n_added} MFASS experimentally validated variants "
-                      f"({len(positives)} pos + {len(negatives)} neg)")
-        except (ImportError, FileNotFoundError):
-            pass
+                print(f"  [GoldStandard] Added {n_added} MFASS variants with minigene sequences "
+                      f"({sum(1 for v in pos_sample if v.label==1)} disruptive + "
+                      f"{sum(1 for v in neg_sample if v.label==0)} benign)")
+                # Position breakdown
+                n_3_10 = sum(1 for v in pos_sample + neg_sample if 3 <= abs(v.position) <= 10)
+                n_gt10 = sum(1 for v in pos_sample + neg_sample if abs(v.position) > 10)
+                print(f"  [GoldStandard]   Positions: {n_3_10} at ±3-10, {n_gt10} at >±10")
+        except (ImportError, FileNotFoundError) as e:
+            print(f"  [GoldStandard] MFASS not available: {e}")
+
 
     def _load_gnomad_negatives(self):
         """
-        Load gnomAD common variants as benign negatives.
-        
-        FIX for Problem 3: Adversarial negatives.
-        gnomAD common variants (AF>1%) are naturally benign (survived
-        natural selection) and have LOW splice tool scores, providing
-        proper contrast against the adversarial S2 negatives that have
-        HIGH splice tool scores by design.
+        Load gnomAD common variants as benign negatives with real hg38 contexts.
         """
         try:
             from src.data.gnomad import load_gnomad_benign_negatives
+            from src.data.hg38_context import extract_splice_context
+
             variants = load_gnomad_benign_negatives(max_variants=500, verbose=False)
 
             n_added = 0
+            n_skipped = 0
             for v in variants:
-                exon1 = _exon_with_ese(random.randint(60, 120))
-                intron = _intron_with_consensus(random.randint(80, 200))
-                exon2 = _exon_with_ese(random.randint(60, 120))
-                wt = exon1 + intron + exon2
+                gene = getattr(v, 'gene', '')
+                hgvs = getattr(v, 'hgvs', '')
+                ctx = None
+                if gene and hgvs:
+                    ctx = extract_splice_context(gene, hgvs)
 
-                abs_pos = abs(v.intronic_position)
-                if v.intronic_position > 0:
-                    var_pos = len(exon1) + abs_pos
-                else:
-                    var_pos = len(exon1) + len(intron) - abs_pos
-                var_pos = max(0, min(var_pos, len(wt) - 1))
+                if ctx is None or not ctx.is_real:
+                    n_skipped += 1
+                    continue
 
-                mut_list = list(wt)
-                ref = mut_list[var_pos]
-                mut_list[var_pos] = v.alt_allele if hasattr(v, 'alt_allele') else \
-                    random.choice([n for n in "ACGT" if n != ref])
-                alt = mut_list[var_pos]
+                var_pos = 0
+                for i in range(min(len(ctx.wt_pre_mrna), len(ctx.mut_pre_mrna))):
+                    if ctx.wt_pre_mrna[i] != ctx.mut_pre_mrna[i]:
+                        var_pos = i
+                        break
+
+                ref_allele = ctx.wt_pre_mrna[var_pos] if var_pos < len(ctx.wt_pre_mrna) else "N"
+                alt_allele = ctx.mut_pre_mrna[var_pos] if var_pos < len(ctx.mut_pre_mrna) else "N"
 
                 self.examples.append(PairedSpliceExample(
-                    wt_pre_mrna=wt[:self.ctx_len],
-                    mut_pre_mrna="".join(mut_list)[:self.ctx_len],
+                    wt_pre_mrna=ctx.wt_pre_mrna[:self.ctx_len],
+                    mut_pre_mrna=ctx.mut_pre_mrna[:self.ctx_len],
                     variant_pos=min(var_pos, self.ctx_len - 1),
-                    ref_allele=ref,
-                    alt_allele=alt,
-                    target_mrna=exon1 + exon2,
+                    ref_allele=ref_allele,
+                    alt_allele=alt_allele,
+                    target_mrna=ctx.wt_mrna,
                     label=0,
                     mechanism="normal",
                 ))
                 n_added += 1
 
             if n_added > 0:
-                print(f"  [GoldStandard] Added {n_added} gnomAD benign negatives")
-        except (ImportError, FileNotFoundError):
-            pass
+                print(f"  [GoldStandard] Added {n_added} gnomAD benign negatives "
+                      f"(skipped {n_skipped} without hg38)")
+        except (ImportError, FileNotFoundError) as e:
+            print(f"  [GoldStandard] gnomAD not available: {e}")
 
     def _augment(self, n_per_variant: int):
-        """Data augmentation via input noise + synthetic balance."""
+        """Data augmentation via input noise on real examples only."""
         original = list(self.examples)
-
-        # Augment existing examples with input noise
         for ex in original:
             for _ in range(n_per_variant):
                 aug_wt = list(ex.wt_pre_mrna)
                 aug_mut = list(ex.mut_pre_mrna)
                 for _ in range(random.randint(1, 3)):
                     pos = random.randint(0, len(aug_wt) - 1)
-                    if pos != ex.variant_pos:  # Don't corrupt the variant itself
+                    if pos != ex.variant_pos:
                         nuc = random.choice("ACGT")
                         aug_wt[pos] = nuc
                         aug_mut[pos] = nuc
-
                 self.examples.append(PairedSpliceExample(
                     wt_pre_mrna="".join(aug_wt)[:self.ctx_len],
                     mut_pre_mrna="".join(aug_mut)[:self.ctx_len],
@@ -611,26 +582,6 @@ class GoldStandardPairedDataset(Dataset):
                     label=ex.label,
                     mechanism=ex.mechanism,
                 ))
-
-        # Add synthetic paired examples for balance
-        for effect in ["exon_skipping", "intron_retention", "partial_deletion"]:
-            for _ in range(n_per_variant * 3):
-                ex = generate_paired_junction(
-                    exon1_len=random.randint(60, 120),
-                    intron_len=random.randint(80, 250),
-                    exon2_len=random.randint(60, 120),
-                )
-                # Override mechanism if needed
-                self.examples.append(ex)
-
-        # Add synthetic benign examples
-        for _ in range(n_per_variant * 5):
-            ex = generate_paired_junction(
-                exon1_len=random.randint(60, 120),
-                intron_len=random.randint(80, 250),
-                exon2_len=random.randint(60, 120),
-            )
-            self.examples.append(ex)
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -647,6 +598,15 @@ class GoldStandardPairedDataset(Dataset):
             "label": torch.tensor(ex.label, dtype=torch.long),
             "tissue_id": torch.tensor(ex.tissue_id, dtype=torch.long),
         }
+
+
+# Global: MFASS training IDs for eval exclusion
+_MFASS_TRAINING_IDS: set = set()
+
+
+def get_mfass_training_ids() -> set:
+    """Return the set of MFASS variant IDs used in training (for eval exclusion)."""
+    return _MFASS_TRAINING_IDS
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -793,7 +753,7 @@ class SpliceTrainer:
         self.model.eval()
         val_losses = []
         # Discrimination tracking: does the model separate disruptive from benign?
-        # Only check first 30 batches to keep validation fast
+        # Only check the first 30 batches to keep validation fast
         distances_disruptive = []
         distances_benign = []
         max_disc_batches = 30
@@ -993,24 +953,27 @@ class SpliceTrainer:
     def pretrain(self) -> dict[str, list[float]]:
         """Stage 1: Pre-train on paired splice junctions.
         
-        Uses GENCODE real splice junctions when available (252K+ real
-        exon-intron-exon triplets from GRCh38). Each real junction is
-        converted to a paired (WT, MUT) example by simulating a variant.
+        Uses GENCODE real splice junctions (252K+ real exon-intron-exon
+        triplets from GRCh38). Each real junction is converted to a
+        paired (WT, MUT) example by simulating a variant.
         
-        Falls back to synthetic paired junctions otherwise.
+        Requires GENCODE GTF + FASTA files in data/external/.
         """
-        if self.config.use_gencode:
-            print("=" * 70)
-            print("STAGE 1: PRE-TRAINING ON GENCODE PAIRED (WT, MUT) SPLICE JUNCTIONS")
-            print(f"  GTF:   {self.config.gencode_gtf_path}")
-            print(f"  FASTA: {self.config.gencode_fasta_path}")
-            print(f"  Max examples: {self.config.gencode_max_examples:,}")
-            print("=" * 70)
-        else:
-            print("=" * 70)
-            print("STAGE 1: PRE-TRAINING ON SYNTHETIC PAIRED (WT, MUT) SPLICE JUNCTIONS")
-            print("  (Set gencode_gtf_path + gencode_fasta_path for real data)")
-            print("=" * 70)
+        if not self.config.use_gencode:
+            raise RuntimeError(
+                "Pre-training requires real GENCODE data. "
+                "Ensure gencode_gtf_path and gencode_fasta_path are set in config.yaml "
+                "and the files exist at:\n"
+                f"  GTF:   {self.config.gencode_gtf_path}\n"
+                f"  FASTA: {self.config.gencode_fasta_path}\n"
+                "Download from: https://www.gencodegenes.org/human/"
+            )
+        print("=" * 70)
+        print("STAGE 1: PRE-TRAINING ON GENCODE PAIRED (WT, MUT) SPLICE JUNCTIONS")
+        print(f"  GTF:   {self.config.gencode_gtf_path}")
+        print(f"  FASTA: {self.config.gencode_fasta_path}")
+        print(f"  Max examples: {self.config.gencode_max_examples:,}")
+        print("=" * 70)
 
         # Use gencode_max_examples when GENCODE is available, otherwise pretrain_samples
         n_samples = (self.config.gencode_max_examples
@@ -1025,13 +988,26 @@ class SpliceTrainer:
         )
         print(f"  Dataset: {len(dataset)} paired examples")
 
-        return self._train_stage(
+        result = self._train_stage(
             dataset=dataset,
             epochs=self.config.pretrain_epochs,
             batch_size=self.config.pretrain_batch_size,
             lr=self.config.pretrain_lr,
             stage_name="pretrain",
         )
+
+        # Save pre-train-only checkpoint for future fine-tune-only reruns
+        pretrain_path = str(Path(self.config.save_dir) / "splice_diffusion_pretrain.pt")
+        Path(self.config.save_dir).mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model_state_dict": self.model.state_dict(),
+            "ema_state": self.ema.state_dict(),
+            "config": self.model.config,
+            "history": self.history,
+        }, pretrain_path)
+        print(f"  Pre-train checkpoint saved: {pretrain_path}")
+
+        return result
 
     def finetune(self) -> dict[str, list[float]]:
         """Stage 2: Fine-tune on gold-standard variants."""

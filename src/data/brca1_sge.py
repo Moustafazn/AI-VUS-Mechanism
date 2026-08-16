@@ -285,10 +285,6 @@ def brca1_sge_to_causal_features(
             ese_ess_score=None,          # No ESRseq
             conservation=v.cadd_score,    # CADD available
             ise_iss_score=None,          # No Spliceogen
-            splice_ai=None,              # No SpliceAI
-            squirls=None,
-            mmsplice=None,
-            cadd_splice=v.cadd_score,
             all_scores={'CADD.score': v.cadd_score} if v.cadd_score else {},
             diffusion_aberrant_fraction=None,
             label=v.label,

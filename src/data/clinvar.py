@@ -261,10 +261,6 @@ def clinvar_to_causal_features(
             ese_ess_score=None,    # No ESRseq available
             conservation=None,     # No CADD available
             ise_iss_score=None,    # No Spliceogen available
-            splice_ai=None,        # No SpliceAI available
-            squirls=None,
-            mmsplice=None,
-            cadd_splice=None,
             all_scores={},         # Empty — all tools missing
             diffusion_aberrant_fraction=None,
             label=v.label,

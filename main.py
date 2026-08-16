@@ -14,9 +14,13 @@ Usage:
     python main.py --spliceai       # SpliceAI head-to-head evaluation
     python main.py --loo            # Leave-one-out cross-validation
     python main.py --ablation       # Run ablation studies
-    python main.py --ablation --id 2  # Run specific ablation
+    python main.py --ablation --id 2  # Run specific ablation (1-4)
+    python main.py --ablation --id 3  # Bayesian only (no diffusion)
+    python main.py --finetune       # Re-run fine-tuning only (loads existing checkpoint)
     python main.py --xai            # XAI analysis
     python main.py --benchmark      # SOTA benchmarking
+    python main.py --generalization # Pre-trained model generalization across domains
+    python main.py --sota-benchmark # Head-to-head: our model vs SpliceAI on shared datasets
     python main.py --eval           # Comprehensive evaluation (leakage, calibration, cold-gene)
     python main.py --all            # Run all phases sequentially
 """
@@ -100,6 +104,26 @@ def phase1_parse():
             print(f"  MFASS: {len(mfass):,} variants ({n_pos} splice-disrupting) — USED IN TRAINING")
     except Exception as e:
         print(f"  MFASS: not available ({e})")
+
+    # Vex-seq (cross-dataset evaluation — exonic splice effects)
+    try:
+        from src.data.vexseq import load_vexseq_variants
+        vexseq = load_vexseq_variants(verbose=False)
+        if vexseq:
+            n_pos = sum(1 for v in vexseq if v.label == 1)
+            print(f"  Vex-seq: {len(vexseq):,} variants ({n_pos} splice-disrupting) — EVAL ONLY")
+    except Exception as e:
+        print(f"  Vex-seq: not available ({e})")
+
+    # SPiP (cross-dataset evaluation — experimentally validated)
+    try:
+        from src.data.spip import load_spip_variants
+        spip = load_spip_variants(verbose=False)
+        if spip:
+            n_pos = sum(1 for v in spip if v.label == 1)
+            print(f"  SPiP: {len(spip):,} variants ({n_pos} splice-disrupting) — EVAL ONLY")
+    except Exception as e:
+        print(f"  SPiP: not available ({e})")
 
     # gnomAD benign negatives (training augmentation)
     try:
@@ -217,6 +241,56 @@ def phase4_training():
     return trainer
 
 
+def phase4_finetune_only():
+    """Phase 4b: Re-run ONLY fine-tuning (loads pre-train checkpoint, skips 3-day pre-training)."""
+    print("\n" + "=" * 70)
+    print("PHASE 4b: FINE-TUNING ONLY (loading pre-trained weights)")
+    print("=" * 70)
+
+    import numpy as np
+    from src.config import get_diffusion_config, get_training_config
+    from src.diffusion.model import BiologicalDiffusionModel
+    from src.diffusion.training import SpliceTrainer
+
+    diff_config = get_diffusion_config()
+    train_config = get_training_config()
+
+    model = BiologicalDiffusionModel(diff_config)
+    trainer = SpliceTrainer(model, train_config)
+
+    # Load existing checkpoint (pre-trained model)
+    ckpt_path = "experiments/checkpoints/splice_diffusion_pretrain.pt"
+    if not Path(ckpt_path).exists():
+        ckpt_path = "experiments/checkpoints/splice_diffusion_model.pt"
+    if not Path(ckpt_path).exists():
+        print(f"  ❌ No checkpoint found. Run --phase 4 first (full training).")
+        return None
+
+    trainer.load_checkpoint(ckpt_path)
+    print(f"  ✅ Loaded checkpoint from {ckpt_path}")
+    print(f"  Re-running fine-tuning with corrected hg38 contexts...\n")
+
+    trainer.finetune()
+    trainer.save_checkpoint()
+
+    if trainer.history["finetune_loss"]:
+        ft_start = np.mean(trainer.history["finetune_loss"][:10])
+        ft_end = np.mean(trainer.history["finetune_loss"][-10:])
+        print(f"\n  Fine-tune loss: {ft_start:.4f} → {ft_end:.4f}")
+
+    from src.utils.results_io import save_results
+    if trainer.history.get("finetune_loss"):
+        save_results("finetune_history.json", {
+            "finetune_loss": trainer.history.get("finetune_loss", []),
+            "finetune_diffusion_loss": trainer.history.get("finetune_diffusion_loss", []),
+            "finetune_contrastive_loss": trainer.history.get("finetune_contrastive_loss", []),
+            "finetune_val_loss": trainer.history.get("finetune_val_loss", []),
+        })
+
+    print("\n✅ Fine-tuning complete (pre-training preserved)")
+    return trainer
+
+
 def phase5_prediction():
     """Phase 5: TEX11 prediction + clinical report."""
     print("\n" + "=" * 70)
@@ -283,6 +357,9 @@ def run_loo_cv():
         )
         features.append(feat)
 
+    # Enrich with diffusion model scores before LOO-CV
+    features = _enrich_features_with_diffusion(features, verbose=True)
+
     results = _run_loo(
         features,
         class_weight_strategy="balanced",
@@ -323,6 +400,9 @@ def run_ablation(ablation_id=None):
             )
             features.append(feat)
 
+        # Enrich with diffusion model scores
+        features = _enrich_features_with_diffusion(features, verbose=True)
+
         return run_ablation_suite(
             features_list=features,
             ablation_ids=[ablation_id] if ablation_id else None,
@@ -339,7 +419,9 @@ def run_xai():
     print("\n" + "=" * 70)
     print("MODULE 3: EXPLAINABLE AI ANALYSIS")
     print("=" * 70)
+    import re
     import torch
+    import numpy as np
     from src.config import get_diffusion_config
     from src.diffusion.model import BiologicalDiffusionModel
     from src.diffusion.training import _exon_with_ese, _intron_with_consensus
@@ -353,11 +435,197 @@ def run_xai():
     context = (exon + intron + _exon_with_ese(60))[:128]
     target = (exon + _exon_with_ese(60))[:128]
 
-    report = run_xai_analysis(model=model, context_seq=context, target_seq=target, verbose=True)
+    # ── Compute Bayesian coefficients from Phase 3 causal model ──
+    bayesian_coefficients = None
+    try:
+        from src.data.parser import parse_dataset
+        from src.features.splice_scores import match_gold_standard_to_s1
+        from src.causal.dag import (
+            extract_causal_features_from_scores, build_improved_model,
+            run_inference, extract_improved_posteriors,
+        )
+
+        print("\n  Building Bayesian causal model for XAI coefficients...")
+        dataset = parse_dataset()
+        gs_scores = match_gold_standard_to_s1(dataset)
+        features = []
+        for m in gs_scores.matched_positives + gs_scores.matched_negatives:
+            position = 0
+            hgvs = m.gold_variant.hgvs.replace(" ", "")
+            pos_match = re.search(r'c\.\d+([+-]\d+)', hgvs)
+            if pos_match:
+                position = int(pos_match.group(1))
+            feat = extract_causal_features_from_scores(
+                variant_name=m.gold_variant.gene_variant,
+                splice_scores=m.splice_scores,
+                position=position,
+                label=m.label,
+                variant_type=getattr(m.gold_variant, 'variant_type', 'Unknown'),
+            )
+            features.append(feat)
+
+        bayes_model, obs = build_improved_model(features, class_weight_strategy="balanced")
+        trace = run_inference(bayes_model, n_samples=2000, n_tune=1000, n_chains=2)
+        posteriors = extract_improved_posteriors(trace, obs["feature_names"])
+
+        bayesian_coefficients = {
+            "betas_mean": posteriors["betas_mean"],
+            "feature_names": obs["feature_names"],
+        }
+        print(f"  ✅ Bayesian coefficients extracted ({len(obs['feature_names'])} features)")
+    except Exception as e:
+        print(f"  ⚠️  Could not compute Bayesian coefficients: {e}")
+        print("  Proceeding without causal path analysis coefficients.")
+
+    report = run_xai_analysis(
+        model=model, context_seq=context, target_seq=target,
+        verbose=True, bayesian_coefficients=bayesian_coefficients,
+    )
     print("\n" + format_attribution_heatmap(report.attribution))
     print("\n✅ XAI analysis complete")
     return report
 
+
+
+def _enrich_features_with_diffusion(features, verbose=True):
+    """
+    Score gold-standard variants with the diffusion model and update CausalFeatures.
+
+    Loads the trained diffusion model, extracts hg38 contexts for each variant,
+    computes disruption_score + contrastive_distance + aberrant_fraction,
+    and stores them in the CausalFeatures — completing the pipeline integration.
+    """
+    import torch
+    from pathlib import Path
+    from src.config import get_diffusion_config, get_device
+    from src.diffusion.model import BiologicalDiffusionModel, VOCAB, tokenize_sequence
+    from src.data.hg38_context import extract_splice_context
+    from src.diffusion.sampling import SpliceSampler, classify_splice_outcome
+
+    ckpt_path = Path("experiments/checkpoints/splice_diffusion_model.pt")
+    if not ckpt_path.exists():
+        if verbose:
+            print("  ⚠️  No diffusion checkpoint — skipping enrichment")
+        return features
+
+    config = get_diffusion_config()
+    device = get_device()
+    model = BiologicalDiffusionModel(config)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if "model_state_dict" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    if verbose:
+        print(f"\n  Enriching {len(features)} variants with diffusion model scores...")
+        print(f"  Model: {model.get_num_params():,} params, device={device}")
+
+    n_scored = 0
+    n_failed = 0
+    for f in features:
+        gene = f.variant_name.split(":")[0] if ":" in f.variant_name else ""
+        hgvs_raw = f.variant_name.split(":", 1)[1] if ":" in f.variant_name else ""
+        hgvs = hgvs_raw.strip()
+
+        if not gene or not hgvs:
+            n_failed += 1
+            continue
+
+        ctx = extract_splice_context(gene.strip(), hgvs)
+        if ctx is None or not ctx.is_real:
+            n_failed += 1
+            continue
+
+        try:
+            wt_ctx_tok = tokenize_sequence(ctx.wt_pre_mrna, config.max_seq_len).unsqueeze(0).to(device)
+            mut_ctx_tok = tokenize_sequence(ctx.mut_pre_mrna, config.max_seq_len).unsqueeze(0).to(device)
+            wt_mrna_tok = tokenize_sequence(ctx.wt_mrna, config.max_seq_len).unsqueeze(0).to(device)
+
+            # Find variant position
+            var_pos = 0
+            for i in range(min(len(ctx.wt_pre_mrna), len(ctx.mut_pre_mrna))):
+                if ctx.wt_pre_mrna[i] != ctx.mut_pre_mrna[i]:
+                    var_pos = i
+                    break
+            var_pos_t = torch.tensor([min(var_pos, config.max_seq_len - 1)], device=device)
+            ref_t = torch.tensor([VOCAB.get(ctx.wt_pre_mrna[var_pos], 3)], device=device)
+            alt_t = torch.tensor([VOCAB.get(ctx.mut_pre_mrna[var_pos], 3)], device=device)
+
+            with torch.no_grad():
+                # Contrastive distance (primary disruption metric)
+                contr = model.compute_contrastive_distance(
+                    wt_ctx_tok, mut_ctx_tok, var_pos_t, ref_t, alt_t
+                )
+                f.diffusion_contrastive_distance = contr["contrastive_distance"]
+
+                # NLL disruption score
+                disruption = model.compute_disruption_score(
+                    wt_mrna_tok, wt_ctx_tok, mut_ctx_tok, var_pos_t, ref_t, alt_t,
+                    n_timestep_samples=10,
+                )
+                f.diffusion_disruption_score = disruption["disruption_score"]
+
+            # Quick aberrant fraction from contrastive distance
+            # (full sampling is too slow for 31 variants in LOGO)
+            f.diffusion_aberrant_fraction = 1.0 if contr["contrastive_distance"] > 0.1 else 0.0
+
+            # === Biological feature enrichment ===
+            # ESE/ESS motif disruption from config.yaml
+            from src.config import get_splice_motifs
+            _splice_motifs = get_splice_motifs()
+            _ESE_HEXAMERS = set(_splice_motifs["ese_hexamers"])
+            _ESS_HEXAMERS = set(_splice_motifs["ess_hexamers"])
+            wt_seq = ctx.wt_pre_mrna
+            mut_seq = ctx.mut_pre_mrna
+            # Count ESE hexamers in 20bp window around variant
+            var_idx = 0
+            for vi in range(min(len(wt_seq), len(mut_seq))):
+                if wt_seq[vi] != mut_seq[vi]:
+                    var_idx = vi
+                    break
+            win_start = max(0, var_idx - 10)
+            win_end = min(len(wt_seq), var_idx + 16)
+            wt_eses = sum(1 for i in range(win_start, win_end - 5)
+                         if wt_seq[i:i+6] in _ESE_HEXAMERS)
+            mut_eses = sum(1 for i in range(win_start, min(win_end, len(mut_seq)) - 5)
+                          if mut_seq[i:i+6] in _ESE_HEXAMERS)
+            ese_lost = max(0, wt_eses - mut_eses)
+
+            # Cryptic splice site: check if mutation creates new GT/AG dinucleotides
+            cryptic_sites = 0
+            for i in range(max(0, var_idx - 5), min(len(mut_seq) - 1, var_idx + 6)):
+                mut_di = mut_seq[i:i+2]
+                wt_di = wt_seq[i:i+2] if i + 1 < len(wt_seq) else ""
+                if mut_di in ("GT", "AG") and wt_di != mut_di:
+                    cryptic_sites += 1
+
+            # Store in features (use existing fields as proxies)
+            if ese_lost > 0 and f.ese_ess_score is None:
+                f.ese_ess_score = float(ese_lost) * 0.5  # Signal ESE disruption
+            if cryptic_sites > 0 and f.ise_iss_score is None:
+                f.ise_iss_score = float(cryptic_sites) * 0.3  # Signal cryptic site
+
+            n_scored += 1
+        except Exception as e:
+            n_failed += 1
+            if verbose:
+                print(f"    ⚠️  {f.variant_name}: {e}")
+
+    if verbose:
+        print(f"  ✅ Diffusion scoring: {n_scored} scored, {n_failed} failed")
+        # Show score distribution
+        scored = [f for f in features if f.diffusion_contrastive_distance is not None]
+        if scored:
+            pos_scores = [f.diffusion_contrastive_distance for f in scored if f.label == 1]
+            neg_scores = [f.diffusion_contrastive_distance for f in scored if f.label == 0]
+            if pos_scores and neg_scores:
+                import numpy as np
+                print(f"  Contrastive distance — Positives: {np.mean(pos_scores):.4f} "
+                      f"vs Negatives: {np.mean(neg_scores):.4f} "
+                      f"(gap: {np.mean(pos_scores) - np.mean(neg_scores):+.4f})")
+
+    return features
 
 
 def run_eval():
@@ -398,6 +666,9 @@ def run_eval():
             variant_type=getattr(m.gold_variant, 'variant_type', 'Unknown'),
         )
         features.append(feat)
+
+    # ── Enrich features with diffusion model scores ──
+    features = _enrich_features_with_diffusion(features, verbose=True)
 
     # ── 1. Leakage analysis ──
     run_leakage_analysis(features, verbose=True)
@@ -579,7 +850,6 @@ def run_eval():
                 print(f"  ⚠️  MaPSy evaluation error: {e}")
                 import traceback
                 traceback.print_exc()
-
         else:
             print("  ⚠️  ClinVar not available — skipping augmented training")
 
@@ -591,10 +861,59 @@ def run_eval():
     print("\n✅ Comprehensive evaluation complete")
 
 
+def run_generalization():
+    """Run pre-trained model generalization evaluation across domains."""
+    from src.baselines.generalization import evaluate_generalization
+    return evaluate_generalization(verbose=True)
+
+
+def run_sota_benchmark():
+    """Run unified SOTA benchmark: our model vs SpliceAI on shared datasets."""
+    from src.baselines.sota_benchmark import run_sota_benchmark as _run
+    return _run(verbose=True)
+
+
 def run_benchmarks():
     """Run SOTA benchmarking against 2022-2026 literature."""
     from src.baselines.benchmark import run_benchmark_comparison
-    return run_benchmark_comparison(our_balanced_accuracy=0.747, verbose=True)
+    from src.utils.results_io import load_results
+
+    # Try to load actual balanced accuracy from saved LOO-CV or evaluation results
+    our_ba = None
+    for results_file in ["loo_cv.json"]:
+        try:
+            saved = load_results(results_file)
+        except FileNotFoundError:
+            continue
+        if saved:
+            # LOO-CV stores BA inside eval_at_optimal
+            eval_opt = saved.get("eval_at_optimal", {})
+            if isinstance(eval_opt, dict) and "balanced_accuracy" in eval_opt:
+                our_ba = eval_opt["balanced_accuracy"]
+                print(f"  Using computed balanced accuracy from {results_file}: {our_ba:.3f}")
+                break
+            # Direct top-level key
+            if "balanced_accuracy" in saved:
+                our_ba = saved["balanced_accuracy"]
+                print(f"  Using computed balanced accuracy from {results_file}: {our_ba:.3f}")
+                break
+
+    if our_ba is None:
+        print("  ⚠️  No saved evaluation results found — running LOO-CV to compute balanced accuracy...")
+        try:
+            loo_results = run_loo_cv()
+            if hasattr(loo_results, 'balanced_accuracy'):
+                our_ba = loo_results.balanced_accuracy
+            elif isinstance(loo_results, dict) and "balanced_accuracy" in loo_results:
+                our_ba = loo_results["balanced_accuracy"]
+        except Exception as e:
+            print(f"  ⚠️  LOO-CV failed: {e}")
+
+    if our_ba is None:
+        our_ba = 0.50  # Conservative default (random baseline)
+        print(f"  ⚠️  Could not compute balanced accuracy — using conservative default: {our_ba}")
+
+    return run_benchmark_comparison(our_balanced_accuracy=our_ba, verbose=True)
 
 
 def print_project_summary():
@@ -614,6 +933,7 @@ def print_project_summary():
     python main.py --spliceai   # SpliceAI head-to-head
     python main.py --loo        # LOO cross-validation
     python main.py --ablation   # Run ablation studies
+    python main.py --finetune   # Re-run fine-tuning only (skips pre-training)
     python main.py --xai        # XAI analysis
     python main.py --benchmark  # SOTA benchmarking
     python main.py --all        # All phases
@@ -631,6 +951,8 @@ def print_project_summary():
         ("src.baselines.tool_evaluation", "Baselines: Tool Evaluation"),
         ("src.baselines.spliceai_evaluation", "Baselines: SpliceAI Eval"),
         ("src.baselines.ablation", "Baselines: Ablation Studies"),
+        ("src.baselines.generalization", "Baselines: Generalization Eval"),
+        ("src.baselines.sota_benchmark", "Baselines: Unified SOTA Benchmark"),
         ("src.baselines.benchmark", "Benchmarks: SOTA Comparison"),
         ("src.xai.attribution", "XAI: Attribution & Causal Paths"),
     ]
@@ -662,9 +984,15 @@ if __name__ == "__main__":
     parser.add_argument("--xai", action="store_true")
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--generalization", action="store_true",
+                        help="Pre-trained model generalization across domains")
+    parser.add_argument("--sota-benchmark", action="store_true", dest="sota_benchmark",
+                        help="Head-to-head: our model vs SpliceAI on shared datasets")
+    parser.add_argument("--finetune", action="store_true",
+                        help="Re-run ONLY fine-tuning (loads pre-train checkpoint, skips pre-training)")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--id", type=int, default=None, dest="ablation_id",
-                        help="Run specific ablation by ID (1-6)")
+                        help="Run specific ablation by ID (1-4)")
 
     args = parser.parse_args()
 
@@ -677,7 +1005,10 @@ if __name__ == "__main__":
         run_xai()
         run_baselines()
         run_spliceai_eval()
+        run_loo_cv()
         run_benchmarks()
+        run_generalization()
+        run_sota_benchmark()
         run_ablation()
         run_eval()
         print("\n" + "=" * 70)
@@ -707,5 +1038,11 @@ if __name__ == "__main__":
         run_eval()
     elif args.benchmark:
         run_benchmarks()
+    elif args.generalization:
+        run_generalization()
+    elif args.finetune:
+        phase4_finetune_only()
+    elif args.sota_benchmark:
+        run_sota_benchmark()
     else:
         print_project_summary()

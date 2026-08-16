@@ -101,6 +101,10 @@ training:
   early_stopping_patience: 5   # Stop if val loss doesn't improve for N epochs (tighter)
   ema_decay: 0.9999         # EMA decay rate for stable inference (Ho et al. 2020)
 
+  # Checkpoint file names (relative to checkpoint_dir)
+  pretrain_checkpoint: "splice_diffusion_pretrain.pt"   # Stage 1 only (for generalization eval)
+  finetune_checkpoint: "splice_diffusion_model.pt"      # Stage 1 + Stage 2 (production)
+
 
 # ── External Data Sources ──────────────────────────────────────────
 # MFASS: 27,733 experimentally tested splice variants (Cheung et al. 2019)
@@ -119,6 +123,67 @@ gnomad:
   min_position: 3           # Skip canonical ±1/2
   max_position: 50          # Include up to ±50bp
   max_negatives: 500        # Max gnomAD negatives for training augmentation
+
+
+# ── Splice Motifs (Biological Definitions) ─────────────────────────
+# ESE/ESS hexamers used in:
+#   1. Pre-training: embedded in synthetic exons to teach ESE recognition
+#   2. Evaluation: ESE disruption scoring for exonic variants
+#
+# Sources:
+#   - RESCUE-ESE: Fairbrother et al., Science 2002 (238 hexamers, top 30 shown)
+#   - ESEfinder: Cartegni et al., NAR 2003 (SR protein binding motifs)
+#   - ESRseq: Ke et al., Genome Research 2011 (empirical ESE/ESS scores)
+#   - ESS: Wang et al., Cell 2004 (exonic splicing silencers)
+splice_motifs:
+  # ESE (Exonic Splicing Enhancers) — variants destroying these disrupt splicing
+  # Top-ranked hexamers from RESCUE-ESE + ESEfinder (high-confidence subset)
+  ese_hexamers:
+    - "GAAGAA"   # SR protein SRSF1 binding (strongest ESE)
+    - "GGAGGA"   # SRSF1 consensus
+    - "AAGAAG"   # SRSF1 variant
+    - "GACGAC"   # SRSF1/SRSF5
+    - "AAGAAC"   # SRSF1
+    - "GAAGGC"   # SRSF1
+    - "AGAAGA"   # SRSF1/SRSF2
+    - "GAAGAG"   # SRSF1
+    - "AACAAG"   # SRSF2 binding
+    - "GAAGAT"   # SRSF1
+    - "TGAGGA"   # SRSF5
+    - "GGAGAA"   # SRSF2
+    - "GAAGGA"   # SRSF1
+    - "AAGAAA"   # SRSF1 variant
+    - "GGAAGA"   # SRSF2/SRSF5
+    - "AGAAGG"   # SRSF1
+    - "GAAGCA"   # SRSF6
+    - "GAAAGA"   # SRSF2
+    - "TTCCTG"   # SRSF5/SRp40
+    - "ACGACG"   # SRSF5
+    - "CTGAAG"   # SRSF2
+    - "GAGGAG"   # SRSF1/SRSF5
+    - "AAGACG"   # SRSF5
+    - "TGGAAG"   # SRSF6
+    - "CTCGTC"   # SRSF5
+    - "CCTCGT"   # SRSF5/SRp40
+
+  # ESS (Exonic Splicing Silencers) — variants creating these may disrupt splicing
+  ess_hexamers:
+    - "TTTTTT"   # hnRNP binding (strong silencer)
+    - "TAGGTA"   # Wang et al. FAS-ESS
+    - "TAGGTG"   # FAS-ESS
+    - "TTTCTT"   # hnRNP A1/A2
+    - "CTTCTT"   # hnRNP
+    - "TGTTGT"   # hnRNP
+    - "GTGTGT"   # hnRNP
+    - "AGGGTA"   # FAS-ESS
+    - "CAGGGT"   # hnRNP binding
+    - "TTGTTT"   # hnRNP A1
+
+  # Splice site consensus motifs
+  donor_consensus: "GTAAGT"     # 5' donor (GT-AG rule)
+  acceptor_consensus: "AG"       # 3' acceptor
+  branch_point: "TACTAAC"       # Lariat branch point (consensus)
+  polypyrimidine_tract: "TTTTCTTTCC"  # PPT upstream of acceptor
 
 
 # ── Tissue Conditioning ────────────────────────────────────────────

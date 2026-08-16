@@ -255,6 +255,10 @@ def build_feature_matrix(features_list: list[CausalFeatures]) -> tuple[np.ndarra
         contrastive = float(f.diffusion_contrastive_distance if f.diffusion_contrastive_distance is not None else 0.0)
         mech = getattr(f, 'diffusion_mechanism_type', 'unknown')
         
+        # Biological features (ESE/cryptic splice site)
+        ese_score = float(f.ese_ess_score if f.ese_ess_score is not None else 0.0)
+        iss_score = float(f.ise_iss_score if f.ise_iss_score is not None else 0.0)
+        
         row = [
             # Position features (non-diffusion)
             float(f.position),
@@ -270,6 +274,9 @@ def build_feature_matrix(features_list: list[CausalFeatures]) -> tuple[np.ndarra
             # Variant type indicators (non-diffusion)
             1.0 if getattr(f, 'variant_type', '') == 'Mis' else 0.0,
             1.0 if getattr(f, 'variant_type', '') == 'Intron' else 0.0,
+            # Biological features (ESE disruption + cryptic splice site)
+            ese_score,
+            iss_score,
         ]
         rows.append(row)
     
@@ -284,6 +291,8 @@ def build_feature_matrix(features_list: list[CausalFeatures]) -> tuple[np.ndarra
         "is_mechanism_intron_retention",
         "is_missense",
         "is_intronic",
+        "ese_disruption",
+        "cryptic_splice_site",
     ]
     
     return np.array(rows, dtype=np.float64), feature_names
