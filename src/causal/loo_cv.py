@@ -53,6 +53,7 @@ def run_loo_cv(
     n_mcmc_tune: int = 1000,
     target_accept: float = 0.95,
     verbose: bool = True,
+    save_filename: str = "loo_cv.json",
 ) -> dict:
     """
     Run full leave-one-out cross-validation on the Bayesian causal model.
@@ -263,9 +264,10 @@ def run_loo_cv(
         "per_variant": per_variant,
     }
 
-    # ── Save JSON results ──
-    from src.utils.results_io import save_results
-    save_results("loo_cv.json", {
+    # ── Save JSON results (skip if save_filename is None) ──
+    if save_filename:
+        from src.utils.results_io import save_results
+        save_results(save_filename, {
         "eval_at_050": eval_050,
         "eval_at_optimal": eval_opt,
         "optimal_threshold": best_thresh,

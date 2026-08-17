@@ -55,6 +55,12 @@ class MFASSVariant:
     label: int                 # 1=splice-disrupting, 0=normal
     splice_disrupting: bool    # Whether variant disrupts splicing
     region: str                # "exonic", "intronic_donor", "intronic_acceptor"
+    # Real sequences from minigene constructs (from the MFASS TSV)
+    chromosome: str = ""       # e.g., "chrX"
+    genomic_position: int = 0  # hg38 0-based SNP position
+    wt_sequence: str = ""      # original_seq — WT minigene construct
+    mut_sequence: str = ""     # mixed_seq — MUT minigene construct
+    wt_mrna: str = ""          # natural_seq — correctly spliced exon
 
 
 def load_mfass_variants(
@@ -169,6 +175,17 @@ def _parse_real_mfass(
             variant_id = row.get('id', '')
             ensembl_id = row.get('ensembl_id', '')
             
+            # Extract sequences and coordinates from the MFASS data
+            chrom = row.get('chr', '')
+            try:
+                genomic_pos = int(row.get('snp_position_hg38_0based_start', '0'))
+            except (ValueError, TypeError):
+                genomic_pos = 0
+
+            wt_seq = row.get('original_seq', '')
+            mut_seq = row.get('mixed_seq', '')
+            wt_mrna_seq = row.get('natural_seq', '')
+
             variants.append(MFASSVariant(
                 variant_id=variant_id,
                 gene=ensembl_id,  # MFASS uses Ensembl exon IDs
@@ -182,6 +199,11 @@ def _parse_real_mfass(
                 label=1 if is_disrupting else 0,
                 splice_disrupting=is_disrupting,
                 region=region,
+                chromosome=chrom,
+                genomic_position=genomic_pos,
+                wt_sequence=wt_seq,
+                mut_sequence=mut_seq,
+                wt_mrna=wt_mrna_seq,
             ))
     
     if verbose:
@@ -189,119 +211,6 @@ def _parse_real_mfass(
     
     return variants
 
-
-def _generate_synthetic_mfass(
-    psi_threshold: float,
-    verbose: bool,
-    n_variants: int = 5000,
-    seed: int = 42,
-) -> list[MFASSVariant]:
-    """
-    Generate a synthetic MFASS-like dataset with biologically realistic properties.
-    
-    The synthetic data follows the empirical distributions from the real MFASS paper:
-    - ~15% of variants cause significant splice disruption (ΔPSI < -0.1)
-    - Canonical positions (±1/2) have ~85% disruption rate
-    - Near-canonical (±3-10) have ~30% disruption rate
-    - Deep intronic (>±10) have ~5% disruption rate
-    - Exonic variants have ~10% disruption rate
-    
-    These rates are derived from Table 1 and Figure 2 of Cheung et al. 2019.
-    
-    IMPORTANT: This is ONLY for development. The paper must use real MFASS data.
-    """
-    import numpy as np
-    rng = np.random.RandomState(seed)
-    
-    genes = [
-        "BRCA1", "BRCA2", "MLH1", "MSH2", "APC", "TP53", "ATM", "PALB2",
-        "CHEK2", "RAD51C", "BARD1", "CDH1", "NF1", "NF2", "TSC1", "TSC2",
-        "PKD1", "PKD2", "CFTR", "DMD", "SMN1", "SMN2", "FBN1", "COL1A1",
-        "RB1", "WT1", "VHL", "PTEN", "STK11", "MUTYH",
-    ]
-    
-    nucleotides = ["A", "C", "G", "T"]
-    
-    variants = []
-    for i in range(n_variants):
-        gene = rng.choice(genes)
-        
-        # Position distribution (matching MFASS empirical distribution)
-        region_r = rng.random()
-        if region_r < 0.15:       # 15% canonical donor
-            position = rng.choice([1, 2])
-            region = "intronic_donor"
-        elif region_r < 0.30:     # 15% canonical acceptor
-            position = rng.choice([-1, -2])
-            region = "intronic_acceptor"
-        elif region_r < 0.50:     # 20% near-canonical
-            position = rng.choice(list(range(3, 11)) + list(range(-10, -2)))
-            region = "intronic_donor" if position > 0 else "intronic_acceptor"
-        elif region_r < 0.65:     # 15% deep intronic
-            position = rng.choice(list(range(11, 51)) + list(range(-50, -10)))
-            region = "intronic_donor" if position > 0 else "intronic_acceptor"
-        else:                     # 35% exonic
-            position = 0
-            region = "exonic"
-        
-        ref = rng.choice(nucleotides)
-        alt = rng.choice([n for n in nucleotides if n != ref])
-        
-        # PSI based on position (matching empirical disruption rates)
-        abs_pos = abs(position)
-        psi_wt = rng.uniform(0.85, 0.99)  # WT typically has high inclusion
-        
-        if abs_pos <= 2:
-            # Canonical: ~85% disruption rate (Cheung et al. Table 1)
-            if rng.random() < 0.85:
-                psi_mut = psi_wt * rng.uniform(0.0, 0.4)  # Strong disruption
-            else:
-                psi_mut = psi_wt * rng.uniform(0.8, 1.0)  # Tolerated
-        elif abs_pos <= 10:
-            # Near-canonical: ~30% disruption rate
-            if rng.random() < 0.30:
-                psi_mut = psi_wt * rng.uniform(0.1, 0.6)
-            else:
-                psi_mut = psi_wt * rng.uniform(0.7, 1.0)
-        elif abs_pos <= 50:
-            # Deep intronic: ~5% disruption rate
-            if rng.random() < 0.05:
-                psi_mut = psi_wt * rng.uniform(0.2, 0.5)
-            else:
-                psi_mut = psi_wt * rng.uniform(0.85, 1.0)
-        else:
-            # Exonic: ~10% disruption rate (ESE/ESS disruption)
-            if rng.random() < 0.10:
-                psi_mut = psi_wt * rng.uniform(0.1, 0.5)
-            else:
-                psi_mut = psi_wt * rng.uniform(0.8, 1.0)
-        
-        delta_psi = psi_mut - psi_wt
-        is_disrupting = delta_psi < psi_threshold
-        
-        hgvs = f"c.100{'+' if position > 0 else ''}{position}{ref}>{alt}" if position != 0 else f"c.100{ref}>{alt}"
-        
-        variants.append(MFASSVariant(
-            variant_id=f"MFASS_{i:05d}",
-            gene=gene,
-            hgvs=hgvs,
-            position=position,
-            ref_allele=ref,
-            alt_allele=alt,
-            psi_mutant=round(psi_mut, 4),
-            psi_wildtype=round(psi_wt, 4),
-            delta_psi=round(delta_psi, 4),
-            label=1 if is_disrupting else 0,
-            splice_disrupting=is_disrupting,
-            region=region,
-        ))
-    
-    if verbose:
-        print(f"  [SYNTHETIC] Generated {n_variants} MFASS-like variants")
-        print(f"  ⚠️  Replace with real MFASS data for publication")
-        _print_mfass_summary(variants)
-    
-    return variants
 
 
 def _print_mfass_summary(variants: list[MFASSVariant]) -> None:
@@ -368,10 +277,6 @@ def mfass_to_causal_features(
             ese_ess_score=None,
             conservation=None,
             ise_iss_score=None,
-            splice_ai=None,
-            squirls=None,
-            mmsplice=None,
-            cadd_splice=None,
             all_scores={},
             diffusion_aberrant_fraction=None,
             label=v.label,

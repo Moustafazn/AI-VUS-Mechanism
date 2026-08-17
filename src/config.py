@@ -166,6 +166,20 @@ def get_training_config():
     )
 
 
+def get_checkpoint_paths() -> dict:
+    """Return checkpoint file paths from config.yaml."""
+    cfg = load_config()
+    tr = cfg.get("training", {})
+    ckpt_dir = tr.get("checkpoint_dir", "experiments/checkpoints")
+    pt_name = tr.get("pretrain_checkpoint", "splice_diffusion_pretrain.pt")
+    ft_name = tr.get("finetune_checkpoint", "splice_diffusion_model.pt")
+    return {
+        "checkpoint_dir": ckpt_dir,
+        "pretrain_checkpoint": f"{ckpt_dir}/{pt_name}",
+        "finetune_checkpoint": f"{ckpt_dir}/{ft_name}",
+    }
+
+
 def get_inference_config() -> dict:
     """Return inference settings from config.yaml."""
     cfg = load_config()
@@ -215,6 +229,28 @@ def get_resource_config() -> dict:
         "gc_collect_every_n_steps": res.get("gc_collect_every_n_steps", 100),
         "auto_reduce_batch_on_oom": res.get("auto_reduce_batch_on_oom", True),
         "min_batch_size": res.get("min_batch_size", 2),
+    }
+
+
+def get_splice_motifs() -> dict:
+    """Return splice motif definitions from config.yaml."""
+    cfg = load_config()
+    motifs = cfg.get("splice_motifs", {})
+    # Defaults matching the hardcoded values
+    default_ese = [
+        "GAAGAA", "GGAGGA", "AAGAAG", "GACGAC", "AAGAAC",
+        "GAAGGC", "AGAAGA", "GAAGAG", "AACAAG", "GAAGAT",
+    ]
+    default_ess = [
+        "TTTTTT", "TAGGTA", "TAGGTG", "TTTCTT", "CTTCTT",
+    ]
+    return {
+        "ese_hexamers": motifs.get("ese_hexamers", default_ese),
+        "ess_hexamers": motifs.get("ess_hexamers", default_ess),
+        "donor_consensus": motifs.get("donor_consensus", "GTAAGT"),
+        "acceptor_consensus": motifs.get("acceptor_consensus", "AG"),
+        "branch_point": motifs.get("branch_point", "TACTAAC"),
+        "polypyrimidine_tract": motifs.get("polypyrimidine_tract", "TTTTCTTTCC"),
     }
 
 

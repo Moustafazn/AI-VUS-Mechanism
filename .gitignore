@@ -51,7 +51,7 @@ env/
 .env
 
 # ── PyTorch / ML artifacts ──
-experiments/checkpoints/
+experiments/
 *.pt
 *.pth
 *.ckpt
@@ -59,6 +59,10 @@ experiments/checkpoints/
 wandb/
 runs/
 lightning_logs/
+
+# ── Paper & results (keep locally, not in repo) ──
+paper/
+TEX11_Clinical_Action_Plan.*
 
 # ── OS files ──
 .DS_Store

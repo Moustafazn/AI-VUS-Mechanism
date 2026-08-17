@@ -29,7 +29,6 @@ from src.diffusion.sampling import (
     OutcomeDistribution,
     print_outcome_distribution,
 )
-from src.diffusion.training import _exon_with_ese, _intron_with_consensus
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -56,46 +55,21 @@ def construct_tex11_context(variant_position: int = 16) -> tuple[str, str, int]:
     Returns:
         (wt_context, mut_context, variant_pos_in_context)
     """
-    try:
-        from src.data.hg38_context import extract_tex11_context as _extract
-        ctx = _extract()
-        # Find variant position by comparing WT and MUT
-        var_pos = 0
-        for i in range(min(len(ctx.wt_pre_mrna), len(ctx.mut_pre_mrna))):
-            if ctx.wt_pre_mrna[i] != ctx.mut_pre_mrna[i]:
-                var_pos = i
-                break
-        return ctx.wt_pre_mrna, ctx.mut_pre_mrna, var_pos
-    except Exception:
-        pass
-
-    # Synthetic fallback
-    exon_upstream = _exon_with_ese(100)
-    donor = "GTAAGT"
-    intron_before = "AGCTTCGACGTC"[:max(0, variant_position - len(donor))]
-    while len(donor) + len(intron_before) < variant_position:
-        intron_before += "A"
-    intron_after = ("TGCAAGCTTGACCTGAAC" + "ATTGC" * 12)[:80]
-    ppt = "TTTTCTTTCCTTTCTT"
-    acceptor = "AG"
-    wt_intron = donor + intron_before + "G" + intron_after + ppt + acceptor
-    mut_intron = donor + intron_before + "T" + intron_after + ppt + acceptor
-    exon_downstream = _exon_with_ese(100)
-
-    wt_context = exon_upstream + wt_intron + exon_downstream
-    mut_context = exon_upstream + mut_intron + exon_downstream
-    var_pos = len(exon_upstream) + len(donor) + len(intron_before)
-
-    return wt_context, mut_context, var_pos
+    from src.data.hg38_context import extract_tex11_context as _extract
+    ctx = _extract()
+    # Find variant position by comparing WT and MUT
+    var_pos = 0
+    for i in range(min(len(ctx.wt_pre_mrna), len(ctx.mut_pre_mrna))):
+        if ctx.wt_pre_mrna[i] != ctx.mut_pre_mrna[i]:
+            var_pos = i
+            break
+    return ctx.wt_pre_mrna, ctx.mut_pre_mrna, var_pos
 
 
 def get_tex11_wildtype_mrna() -> str:
-    """Get expected WT mRNA for TEX11."""
-    try:
-        from src.data.hg38_context import extract_tex11_context as _extract
-        return _extract().wt_mrna
-    except Exception:
-        return _exon_with_ese(100) + _exon_with_ese(100)
+    """Get expected WT mRNA for TEX11 from hg38."""
+    from src.data.hg38_context import extract_tex11_context as _extract
+    return _extract().wt_mrna
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -443,8 +417,8 @@ def run_tex11_prediction(
         protein_consequence=protein_cons,
         acmg_criteria=acmg_criteria,
         acmg_classification=classification,
-        primary_causal_path="V → I → O (variant disrupts ISE motif at +14-18 → aberrant splicing)",
-        causal_path_probability=0.72,
+        primary_causal_path=posterior_p.get("primary_causal_path", "unknown"),
+        causal_path_probability=posterior_p.get("causal_path_probability", 0.0),
         counterfactual_normal_probability=1.0 - wt_distribution.aberrant_fraction,
     )
 
@@ -552,11 +526,36 @@ def _compute_bayesian_posterior(
         )
 
     p_samples = trace.posterior["p_disruption"].values.flatten()
+
+    # Extract coefficient posteriors to determine dominant causal path
+    beta_pos_samples = trace.posterior["beta_position"].values.flatten()
+    beta_diff_samples = trace.posterior["beta_diffusion"].values.flatten()
+    beta_mech_samples = trace.posterior["beta_mechanism"].values.flatten()
+
+    # Map coefficients to causal paths
+    path_strengths = {
+        "V → P → O (position-mediated splice site disruption)": float(np.abs(beta_pos_samples.mean())),
+        "V → D → O (diffusion-detected aberrant splicing)": float(np.abs(beta_diff_samples.mean())),
+        "V → M → O (mechanism-driven splice disruption)": float(np.abs(beta_mech_samples.mean())),
+    }
+    # For intronic variants at non-canonical positions, refine the path description
+    if abs(variant_position) > 10:
+        path_strengths["V → I → O (variant disrupts intronic regulatory element)"] = (
+            path_strengths.pop("V → P → O (position-mediated splice site disruption)")
+        )
+
+    dominant_path = max(path_strengths, key=path_strengths.get)
+    total_strength = sum(path_strengths.values())
+    dominant_probability = path_strengths[dominant_path] / total_strength if total_strength > 0 else 0.0
+
     return {
         "mean": float(p_samples.mean()),
         "lower": float(np.percentile(p_samples, 2.5)),
         "upper": float(np.percentile(p_samples, 97.5)),
         "method": "mcmc",
+        "primary_causal_path": dominant_path,
+        "causal_path_probability": dominant_probability,
+        "path_strengths": path_strengths,
     }
 
 
@@ -566,33 +565,17 @@ def _compute_bayesian_posterior_analytical(
     variant_position: int,
     gene: str,
 ) -> dict:
-    """Analytical Bayesian approximation (fast fallback)."""
-    if variant_position <= 2:
-        position_prior = 0.95
-    elif variant_position <= 6:
-        position_prior = 0.80
-    elif variant_position <= 20:
-        position_prior = 0.40
-    elif variant_position <= 50:
-        position_prior = 0.15
-    else:
-        position_prior = 0.05
+    """
+    Analytical Bayesian approximation — used ONLY when PyMC is not installed.
 
-    posterior_d = aberrant_fraction * position_prior
-    posterior_n = (1 - aberrant_fraction) * (1 - position_prior)
-    total = posterior_d + posterior_n
-    posterior_mean = posterior_d / total if total > 0 else 0.5
-
-    n_eff = max(10, int(aberrant_fraction * 100))
-    se = np.sqrt(posterior_mean * (1 - posterior_mean) / n_eff)
-    margin = 1.96 * se + 0.05
-
-    return {
-        "mean": posterior_mean,
-        "lower": max(0.0, posterior_mean - margin),
-        "upper": min(1.0, posterior_mean + margin),
-        "method": "analytical",
-    }
+    Raises RuntimeError to enforce MCMC-based inference.
+    The MCMC method (_compute_bayesian_posterior with use_mcmc=True) should
+    always be used for scientifically valid results.
+    """
+    raise RuntimeError(
+        "Analytical Bayesian approximation is not available. "
+        "Install PyMC for MCMC-based posterior inference: pip install pymc"
+    )
 
 
 if __name__ == "__main__":

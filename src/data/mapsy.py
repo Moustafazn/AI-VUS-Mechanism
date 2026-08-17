@@ -53,6 +53,9 @@ from typing import Optional
 MAPSY_PATH = "data/external/mapsy_soemedi2017.xlsx"
 
 
+CLINVAR_SUMMARY_PATH = "data/external/variant_summary.txt.gz"
+
+
 @dataclass
 class MaPSyVariant:
     """A single MaPSy experimentally tested exonic variant."""
@@ -61,6 +64,11 @@ class MaPSyVariant:
     alt_allele: str
     esm: int                       # 1=exonic splice mutation, 0=no effect
     label: int                     # Same as esm: 1=splice-disrupting, 0=normal
+    # Genomic coordinates (resolved from ClinVar via dbSNP ID)
+    gene: str = ""                 # Gene symbol (from ClinVar)
+    chromosome: str = ""           # e.g., "chr1"
+    genomic_position: int = 0      # hg38 position
+    hgvs: str = ""                 # cDNA notation (from ClinVar Name field)
 
 
 def load_mapsy_variants(
@@ -131,10 +139,198 @@ def load_mapsy_variants(
             label=esm,  # ESM=1 means splice-disrupting
         ))
 
+    # Resolve dbSNP IDs → genomic coordinates via ClinVar
+    _resolve_dbsnp_coordinates(variants, verbose=verbose)
+
     if verbose:
         _print_mapsy_summary(variants)
 
     return variants
+
+
+def _resolve_dbsnp_coordinates(
+    variants: list[MaPSyVariant],
+    clinvar_path: str = CLINVAR_SUMMARY_PATH,
+    verbose: bool = True,
+) -> None:
+    """
+    Resolve dbSNP rs IDs to genomic coordinates using ClinVar variant_summary.txt.gz.
+
+    ClinVar contains RS# (dbSNP) → GeneSymbol, Chromosome, Start, Assembly mappings.
+    We filter to Assembly=GRCh38 and build a lookup table.
+    """
+    import gzip
+    import csv
+
+    clinvar_file = Path(clinvar_path)
+    if not clinvar_file.exists():
+        if verbose:
+            print(f"  ⚠️  ClinVar variant_summary not found at {clinvar_path}")
+            print(f"  Cannot resolve dbSNP → coordinates for MaPSy variants")
+        return
+
+    # Collect the dbSNP IDs we need to look up
+    rs_ids_needed = set()
+    for v in variants:
+        if v.dbsnp_id.startswith("rs"):
+            # ClinVar stores RS# without the "rs" prefix
+            rs_ids_needed.add(v.dbsnp_id[2:])
+
+    if not rs_ids_needed:
+        return
+
+    if verbose:
+        print(f"  Resolving {len(rs_ids_needed)} dbSNP IDs from ClinVar...")
+
+    # Build lookup from ClinVar (filter to GRCh38)
+    rs_to_info: dict[str, dict] = {}
+
+    with gzip.open(clinvar_file, 'rt') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            rs = row.get('RS# (dbSNP)', '-1')
+            if rs in rs_ids_needed and row.get('Assembly') == 'GRCh38':
+                chrom = row.get('Chromosome', '')
+                start = row.get('Start', '0')
+                gene = row.get('GeneSymbol', '')
+                name = row.get('Name', '')  # Often contains HGVS-like notation
+
+                if chrom and start and start != '-1':
+                    rs_to_info[rs] = {
+                        'chromosome': f"chr{chrom}" if not chrom.startswith("chr") else chrom,
+                        'position': int(start),
+                        'gene': gene,
+                        'name': name,
+                    }
+
+            # Stop early if we found all needed IDs
+            if len(rs_to_info) >= len(rs_ids_needed):
+                break
+
+    # Populate variant fields
+    n_resolved = 0
+    for v in variants:
+        if v.dbsnp_id.startswith("rs"):
+            rs_num = v.dbsnp_id[2:]
+            if rs_num in rs_to_info:
+                info = rs_to_info[rs_num]
+                v.gene = info['gene']
+                v.chromosome = info['chromosome']
+                v.genomic_position = info['position']
+                v.hgvs = info['name']
+                n_resolved += 1
+
+    if verbose:
+        print(f"  Resolved {n_resolved}/{len(variants)} MaPSy variants "
+              f"from ClinVar (GRCh38)")
+
+    # Resolve remaining IDs via NCBI dbSNP API
+    unresolved = [v for v in variants if v.genomic_position == 0 and v.dbsnp_id.startswith("rs")]
+    if unresolved:
+        n_api = _resolve_via_dbsnp_api(unresolved, verbose=verbose)
+        n_resolved += n_api
+
+
+def _resolve_via_dbsnp_api(
+    variants: list[MaPSyVariant],
+    verbose: bool = True,
+) -> int:
+    """
+    Resolve unresolved dbSNP IDs via NCBI dbSNP REST API.
+
+    API: https://api.ncbi.nlm.nih.gov/variation/v0/refsnp/{rsid}
+    Returns GRCh38 coordinates for each variant.
+    """
+    import json
+    import time
+    import ssl
+    try:
+        import urllib.request
+    except ImportError:
+        return 0
+
+    if verbose:
+        print(f"  Resolving {len(variants)} remaining IDs via NCBI dbSNP API...")
+
+    # Create SSL context (handle macOS certificate issues)
+    ssl_ctx = ssl._create_unverified_context()
+
+    n_resolved = 0
+    for i, v in enumerate(variants):
+        rs_num = v.dbsnp_id[2:]  # Remove "rs" prefix
+        # Use NCBI E-utilities efetch (more reliable than variation API)
+        url = (f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?"
+               f"db=snp&id={rs_num}&rettype=json&retmode=text")
+
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+                text = resp.read().decode('utf-8')
+                data = json.loads(text)
+
+            # Navigate the dbSNP JSON response
+            psd = data.get("primary_snapshot_data", {})
+            placements = psd.get("placements_with_allele", [])
+
+            for p in placements:
+                ann = p.get("placement_annot", {})
+                traits = ann.get("seq_id_traits_by_assembly", [])
+                for t in traits:
+                    if t.get("assembly_name", "").startswith("GRCh38"):
+                        alleles = p.get("alleles", [])
+                        if alleles:
+                            spdi = alleles[0].get("allele", {}).get("spdi", {})
+                            position = spdi.get("position", 0)
+                            seq_id = spdi.get("seq_id", "")
+                            chrom = _refseq_to_chrom(seq_id)
+
+                            if chrom and position > 0:
+                                v.chromosome = chrom
+                                v.genomic_position = position
+                                # Try to get gene from annotations
+                                for ga in psd.get("allele_annotations", []):
+                                    for aa in ga.get("assembly_annotation", []):
+                                        for g in aa.get("genes", []):
+                                            v.gene = g.get("locus", "") or g.get("name", "")
+                                            if v.gene:
+                                                break
+                                n_resolved += 1
+                                break
+                if v.genomic_position > 0:
+                    break
+
+        except Exception:
+            pass
+
+        # Rate limit: NCBI allows ~3 requests/second without API key
+        if (i + 1) % 3 == 0:
+            time.sleep(0.4)
+
+        if verbose and (i + 1) % 50 == 0:
+            print(f"    API progress: {i + 1}/{len(variants)} "
+                  f"(resolved {n_resolved} so far)")
+
+    if verbose:
+        print(f"  Resolved {n_resolved}/{len(variants)} additional variants "
+              f"via dbSNP API")
+
+    return n_resolved
+
+
+def _refseq_to_chrom(seq_id: str) -> str:
+    """Map RefSeq accession (NC_000001.11) to chromosome name (chr1)."""
+    # GRCh38 RefSeq accessions for chromosomes
+    mapping = {
+        "NC_000001.11": "chr1", "NC_000002.12": "chr2", "NC_000003.12": "chr3",
+        "NC_000004.12": "chr4", "NC_000005.10": "chr5", "NC_000006.12": "chr6",
+        "NC_000007.14": "chr7", "NC_000008.11": "chr8", "NC_000009.12": "chr9",
+        "NC_000010.11": "chr10", "NC_000011.10": "chr11", "NC_000012.12": "chr12",
+        "NC_000013.11": "chr13", "NC_000014.9": "chr14", "NC_000015.10": "chr15",
+        "NC_000016.10": "chr16", "NC_000017.11": "chr17", "NC_000018.10": "chr18",
+        "NC_000019.10": "chr19", "NC_000020.11": "chr20", "NC_000021.9": "chr21",
+        "NC_000022.11": "chr22", "NC_000023.11": "chrX", "NC_000024.10": "chrY",
+    }
+    return mapping.get(seq_id, "")
 
 
 def _print_mapsy_summary(variants: list[MaPSyVariant]) -> None:
@@ -172,10 +368,6 @@ def mapsy_to_causal_features(
             ese_ess_score=None,
             conservation=None,
             ise_iss_score=None,
-            splice_ai=None,
-            squirls=None,
-            mmsplice=None,
-            cadd_splice=None,
             all_scores={},
             diffusion_aberrant_fraction=None,
             label=v.label,

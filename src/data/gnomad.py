@@ -243,10 +243,6 @@ def gnomad_to_causal_features(
             ese_ess_score=None,
             conservation=None,
             ise_iss_score=None,
-            splice_ai=None,
-            squirls=None,
-            mmsplice=None,
-            cadd_splice=None,
             all_scores={},
             diffusion_aberrant_fraction=None,
             label=0,  # Benign

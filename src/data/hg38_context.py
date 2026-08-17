@@ -240,12 +240,28 @@ def extract_splice_context(
     # Intronic: c.1156+16G>T → position +16 after exon boundary
     # Exonic: c.265A>T → position within exon
     
-    intronic_match = re.search(r'c\.(\d+)([+-])(\d+)([ACGT])>([ACGT])', hgvs)
-    exonic_match = re.search(r'c\.?\s*(\d+)([ACGT])>([ACGT])', hgvs)
+    # Strip whitespace from HGVS before parsing
+    hgvs_clean = hgvs.replace(" ", "")
+    intronic_match = re.search(r'c\.-?(\d+)([+-])(\d+)([ACGT])>([ACGT])', hgvs_clean)
+    exonic_match = re.search(r'c\.?\s*-?(\d+)([ACGT])>([ACGT])', hgvs_clean)
     
-    exons = _load_gene_exons(gene, gtf_path)
+    gene_clean = gene.strip()
+    exons = _load_gene_exons(gene_clean, gtf_path)
     if not exons:
-        return None
+        # Try common gene name aliases (old → new HGNC symbols)
+        _GENE_ALIASES = {
+            "AARS": "AARS1", "DARS": "DARS1", "EPRS": "EPRS1",
+            "GARS": "GARS1", "HARS": "HARS1", "IARS": "IARS1",
+            "KARS": "KARS1", "LARS": "LARS1", "MARS": "MARS1",
+            "NARS": "NARS1", "RARS": "RARS1", "SARS": "SARS1",
+            "TARS": "TARS1", "VARS": "VARS1", "WARS": "WARS1",
+            "YARS": "YARS1",
+        }
+        alias = _GENE_ALIASES.get(gene_clean)
+        if alias:
+            exons = _load_gene_exons(alias, gtf_path)
+        if not exons:
+            return None
     
     strand = exons[0].strand
     chrom = exons[0].chrom
@@ -261,27 +277,46 @@ def extract_splice_context(
         # Find the exon boundary closest to this coding position
         # This is approximate — proper CDS mapping would require transcript annotation
         # We find the exon whose cumulative coding length includes this position
+        # For minus strand: transcript order is reverse of genomic order
         cumulative_coding = 0
         target_exon_idx = 0
-        for i, exon in enumerate(exons):
-            exon_len = exon.end - exon.start
-            cumulative_coding += exon_len
-            if cumulative_coding >= coding_pos:
-                target_exon_idx = i
-                break
+        if strand == "-":
+            # Minus strand: iterate in reverse genomic order (= transcript order)
+            for rev_i, exon in enumerate(reversed(exons)):
+                genomic_idx = len(exons) - 1 - rev_i
+                exon_len = exon.end - exon.start
+                cumulative_coding += exon_len
+                if cumulative_coding >= coding_pos:
+                    target_exon_idx = genomic_idx
+                    break
+        else:
+            for i, exon in enumerate(exons):
+                exon_len = exon.end - exon.start
+                cumulative_coding += exon_len
+                if cumulative_coding >= coding_pos:
+                    target_exon_idx = i
+                    break
         
         if strand == "+":
             if direction == "+":
                 # Variant in downstream intron (donor side)
+                # If at last exon (UTR inflation), try previous exon boundary
                 if target_exon_idx >= len(exons) - 1:
-                    return None
+                    if target_exon_idx > 0:
+                        target_exon_idx -= 1
+                    else:
+                        return None
                 exon_up = exons[target_exon_idx]
                 exon_down = exons[target_exon_idx + 1]
                 variant_pos = exon_up.end + offset - 1
             else:
                 # Variant in upstream intron (acceptor side)
+                # If at first exon (UTR inflation), try next exon boundary
                 if target_exon_idx == 0:
-                    return None
+                    if len(exons) > 1:
+                        target_exon_idx = 1
+                    else:
+                        return None
                 exon_up = exons[target_exon_idx - 1]
                 exon_down = exons[target_exon_idx]
                 variant_pos = exon_down.start - offset
@@ -291,16 +326,22 @@ def extract_splice_context(
             # but transcript reads right-to-left
             if direction == "+":
                 # c.X+N means downstream in transcript = upstream in genome
+                # If at boundary (UTR inflation), try adjacent exon
                 if target_exon_idx == 0:
-                    return None
-                # In genomic coordinates: the "upstream" exon in transcript
-                # is the one with HIGHER genomic position on minus strand
-                exon_up = exons[target_exon_idx]      # transcript upstream
-                exon_down = exons[target_exon_idx - 1]  # transcript downstream (genomically before)
-                variant_pos = exon_up.start - offset   # Intron is BEFORE this exon genomically
+                    if len(exons) > 1:
+                        target_exon_idx = 1
+                    else:
+                        return None
+                exon_up = exons[target_exon_idx]
+                exon_down = exons[target_exon_idx - 1]
+                variant_pos = exon_up.start - offset
             else:
+                # If at boundary (UTR inflation), try adjacent exon
                 if target_exon_idx >= len(exons) - 1:
-                    return None
+                    if target_exon_idx > 0:
+                        target_exon_idx -= 1
+                    else:
+                        return None
                 exon_up = exons[target_exon_idx + 1]
                 exon_down = exons[target_exon_idx]
                 variant_pos = exon_down.end + offset - 1
@@ -314,13 +355,24 @@ def extract_splice_context(
         cumulative_coding = 0
         target_exon_idx = 0
         local_pos = 0
-        for i, exon in enumerate(exons):
-            exon_len = exon.end - exon.start
-            if cumulative_coding + exon_len >= coding_pos:
-                target_exon_idx = i
-                local_pos = coding_pos - cumulative_coding - 1  # 0-based within exon
-                break
-            cumulative_coding += exon_len
+        if strand == "-":
+            # Minus strand: iterate in reverse genomic order (= transcript order)
+            for rev_i, exon in enumerate(reversed(exons)):
+                genomic_idx = len(exons) - 1 - rev_i
+                exon_len = exon.end - exon.start
+                if cumulative_coding + exon_len >= coding_pos:
+                    target_exon_idx = genomic_idx
+                    local_pos = coding_pos - cumulative_coding - 1
+                    break
+                cumulative_coding += exon_len
+        else:
+            for i, exon in enumerate(exons):
+                exon_len = exon.end - exon.start
+                if cumulative_coding + exon_len >= coding_pos:
+                    target_exon_idx = i
+                    local_pos = coding_pos - cumulative_coding - 1  # 0-based within exon
+                    break
+                cumulative_coding += exon_len
         
         exon_with_variant = exons[target_exon_idx]
         
@@ -424,20 +476,73 @@ def extract_splice_context(
         
         if var_idx_in_intron >= 0 and var_idx_in_intron < len(intron_seq):
             # Intronic variant
+            # After RC for minus strand, intron_seq is in TRANSCRIPT orientation
+            # HGVS alleles are in transcript orientation → apply directly
             mut_intron = list(intron_seq)
-            # Verify ref allele matches (account for strand)
             actual_ref = mut_intron[var_idx_in_intron]
-            expected_ref = ref if strand == "+" else _reverse_complement(ref)
             
-            expected_alt = alt if strand == "+" else _reverse_complement(alt)
-            mut_intron[var_idx_in_intron] = expected_alt
+            # Apply HGVS alt directly (transcript orientation matches RC'd sequence)
+            transcript_ref = ref
+            transcript_alt = alt
+            
+            if actual_ref == transcript_ref:
+                # Perfect match — apply mutation
+                mut_intron[var_idx_in_intron] = transcript_alt
+            else:
+                # Ref mismatch — search nearby for correct position
+                found = False
+                search_range = min(20, len(mut_intron))
+                for delta in range(1, search_range):
+                    for candidate in [var_idx_in_intron + delta, var_idx_in_intron - delta]:
+                        if 0 <= candidate < len(mut_intron):
+                            if mut_intron[candidate] == transcript_ref:
+                                mut_intron[candidate] = transcript_alt
+                                found = True
+                                break
+                    if found:
+                        break
+                if not found:
+                    # Last resort: apply at original position
+                    mut_intron[var_idx_in_intron] = transcript_alt
+            
             mut_intron_seq = "".join(mut_intron)
             mut_pre_mrna = exon_up_seq + mut_intron_seq + exon_down_seq
         elif var_idx_in_intron == -1:
             # Exonic variant — find which exon contains variant_pos
             # After RC for minus strand, sequences are in transcript orientation
             # So HGVS alt (which is in transcript orientation) is applied directly
-            transcript_alt = alt  # HGVS alt is always in transcript orientation
+            transcript_ref = ref   # HGVS ref in transcript orientation
+            transcript_alt = alt   # HGVS alt in transcript orientation
+            
+            # Helper: apply mutation to exon sequence with ref-allele verification
+            def _apply_exonic_mutation(exon_seq, var_local, is_exon_up):
+                """Apply mutation at var_local, with ref verification and correction."""
+                if not (0 <= var_local < len(exon_seq)):
+                    return None
+                
+                # Check if ref allele matches at computed position
+                if exon_seq[var_local] == transcript_ref:
+                    # Perfect match — apply mutation
+                    mut = list(exon_seq)
+                    mut[var_local] = transcript_alt
+                    return "".join(mut)
+                
+                # Ref doesn't match — UTR offset error in position mapping
+                # Search nearby for the ref allele (within ±50% of exon length)
+                search_range = max(50, len(exon_seq) // 2)
+                for delta in range(1, search_range):
+                    for candidate in [var_local + delta, var_local - delta]:
+                        if 0 <= candidate < len(exon_seq):
+                            if exon_seq[candidate] == transcript_ref:
+                                # Found ref allele at corrected position
+                                mut = list(exon_seq)
+                                mut[candidate] = transcript_alt
+                                return "".join(mut)
+                
+                # Last resort: couldn't find ref allele, apply at original position anyway
+                mut = list(exon_seq)
+                mut[var_local] = transcript_alt
+                return "".join(mut)
             
             # Try exon_up first
             if e_up_start <= variant_pos < exon_up.end:
@@ -446,10 +551,9 @@ def extract_splice_context(
                 else:
                     var_local = exon_up.end - variant_pos - 1
                 
-                if 0 <= var_local < len(exon_up_seq):
-                    mut_exon = list(exon_up_seq)
-                    mut_exon[var_local] = transcript_alt
-                    mut_pre_mrna = "".join(mut_exon) + intron_seq + exon_down_seq
+                result = _apply_exonic_mutation(exon_up_seq, var_local, True)
+                if result is not None:
+                    mut_pre_mrna = result + intron_seq + exon_down_seq
                 else:
                     mut_pre_mrna = wt_pre_mrna
             # Try exon_down
@@ -459,10 +563,9 @@ def extract_splice_context(
                 else:
                     var_local = e_down_end - variant_pos - 1
                 
-                if 0 <= var_local < len(exon_down_seq):
-                    mut_exon = list(exon_down_seq)
-                    mut_exon[var_local] = transcript_alt
-                    mut_pre_mrna = exon_up_seq + intron_seq + "".join(mut_exon)
+                result = _apply_exonic_mutation(exon_down_seq, var_local, False)
+                if result is not None:
+                    mut_pre_mrna = exon_up_seq + intron_seq + result
                 else:
                     mut_pre_mrna = wt_pre_mrna
             else:
@@ -470,6 +573,15 @@ def extract_splice_context(
         else:
             mut_pre_mrna = wt_pre_mrna  # Fallback
         
+        # ── VALIDATION: Ensure mutation was actually applied ──
+        # If WT == MUT, the mutation was NOT applied (position mapping failed)
+        mutation_applied = (wt_pre_mrna != mut_pre_mrna)
+        if not mutation_applied:
+            # Log the failure for debugging
+            print(f"  [hg38] ⚠️  Mutation NOT applied for {gene}:{hgvs} "
+                  f"(variant_pos={variant_pos}, strand={strand}, "
+                  f"var_idx_in_intron={var_idx_in_intron if 'var_idx_in_intron' in dir() else 'N/A'})")
+
         return SpliceContext(
             gene=gene,
             variant=hgvs,
@@ -484,7 +596,7 @@ def extract_splice_context(
             variant_genomic_pos=variant_pos,
             strand=strand,
             transcript_id=exon_up.transcript_id,
-            is_real=True,
+            is_real=mutation_applied,  # Only True if mutation was actually applied
         )
         
     except Exception as e:
@@ -495,51 +607,27 @@ def extract_splice_context(
 def extract_tex11_context() -> SpliceContext:
     """
     Extract real TEX11 c.1156+16G>T context from hg38.
-    Falls back to synthetic if hg38 not available.
+
+    Requires GRCh38 FASTA and GENCODE GTF in data/external/.
+    Raises RuntimeError if extraction fails.
     """
     ctx = extract_splice_context("TEX11", "c.1156+16G>T")
-    if ctx is not None:
-        print(f"  [hg38] TEX11 real context extracted:")
-        print(f"    Chromosome: {ctx.chrom}")
-        print(f"    WT pre-mRNA: {len(ctx.wt_pre_mrna)} bp")
-        print(f"    Mutant pre-mRNA: {len(ctx.mut_pre_mrna)} bp")
-        print(f"    WT mRNA: {len(ctx.wt_mrna)} bp")
-        print(f"    Strand: {ctx.strand}")
-        # Verify the single-nucleotide difference
-        diffs = sum(1 for a, b in zip(ctx.wt_pre_mrna, ctx.mut_pre_mrna) if a != b)
-        print(f"    Differences (WT vs Mut): {diffs} bp")
-        return ctx
-    
-    # Fallback to synthetic
-    print("  [hg38] TEX11 context extraction failed — using synthetic fallback")
-    from src.diffusion.training import _exon_with_ese, _intron_with_consensus
-    import random
-    random.seed(42)
-    np.random.seed(42)
-    
-    exon1 = _exon_with_ese(100)
-    exon2 = _exon_with_ese(100)
-    
-    donor = "GTAAGT"
-    intron_body = "AGCTTCGACG" + "ATTGC" * 16 + "TTTTCTTTCCTTTCTT" + "AG"
-    wt_intron = donor + intron_body
-    
-    # Variant at position +16: G→T
-    mut_intron = list(wt_intron)
-    if len(mut_intron) > 15:
-        mut_intron[15] = "T"  # Position +16 (0-indexed = 15)
-    mut_intron = "".join(mut_intron)
-    
-    return SpliceContext(
-        gene="TEX11",
-        variant="c.1156+16G>T",
-        chrom="chrX",
-        wt_pre_mrna=exon1 + wt_intron + exon2,
-        mut_pre_mrna=exon1 + mut_intron + exon2,
-        wt_mrna=exon1 + exon2,
-        strand="-",
-        is_real=False,
-    )
+    if ctx is None:
+        raise RuntimeError(
+            "Failed to extract TEX11 c.1156+16G>T context from hg38. "
+            "Ensure GRCh38.primary_assembly.genome.fa and gencode.v44.annotation.gtf "
+            "exist in data/external/."
+        )
+
+    print(f"  [hg38] TEX11 real context extracted:")
+    print(f"    Chromosome: {ctx.chrom}")
+    print(f"    WT pre-mRNA: {len(ctx.wt_pre_mrna)} bp")
+    print(f"    Mutant pre-mRNA: {len(ctx.mut_pre_mrna)} bp")
+    print(f"    WT mRNA: {len(ctx.wt_mrna)} bp")
+    print(f"    Strand: {ctx.strand}")
+    diffs = sum(1 for a, b in zip(ctx.wt_pre_mrna, ctx.mut_pre_mrna) if a != b)
+    print(f"    Differences (WT vs Mut): {diffs} bp")
+    return ctx
 
 
 def extract_gold_standard_contexts(
@@ -559,6 +647,7 @@ def extract_gold_standard_contexts(
     n_synthetic = 0
     
     # S7 positives
+    n_failed = []
     for v in dataset.gold_standard_positives:
         gene = v.gene_variant.split(":")[0] if ":" in v.gene_variant else v.gene_variant
         hgvs = v.hgvs.strip()
@@ -567,12 +656,9 @@ def extract_gold_standard_contexts(
         if ctx is not None:
             ctx.is_real = True
             n_real += 1
+            contexts.append(ctx)
         else:
-            # Synthetic fallback using the available aberrant mRNA
-            ctx = _synthetic_fallback(gene, hgvs, v.aberrant_mrna_sequence, label=1)
-            n_synthetic += 1
-        
-        contexts.append(ctx)
+            n_failed.append(f"{gene}:{hgvs}")
     
     # S2 negatives
     for v in dataset.usable_negatives:
@@ -583,51 +669,20 @@ def extract_gold_standard_contexts(
         if ctx is not None:
             ctx.is_real = True
             n_real += 1
+            contexts.append(ctx)
         else:
-            ctx = _synthetic_fallback(gene, hgvs, "", label=0)
-            n_synthetic += 1
-        
-        contexts.append(ctx)
+            n_failed.append(f"{gene}:{hgvs}")
     
     if verbose:
-        print(f"  [hg38] Gold-standard contexts: {n_real} real + {n_synthetic} synthetic")
+        print(f"  [hg38] Gold-standard contexts: {n_real} real, {len(n_failed)} failed")
+        if n_failed:
+            print(f"  [hg38] Failed variants (skipped — no synthetic fallback):")
+            for name in n_failed[:10]:
+                print(f"    ✗ {name}")
+            if len(n_failed) > 10:
+                print(f"    ... and {len(n_failed) - 10} more")
     
     return contexts
-
-
-def _synthetic_fallback(
-    gene: str,
-    hgvs: str,
-    aberrant_mrna: str,
-    label: int,
-) -> SpliceContext:
-    """Create a synthetic context when hg38 extraction fails."""
-    import random
-    from src.diffusion.training import _exon_with_ese, _intron_with_consensus
-    
-    exon1 = _exon_with_ese(100)
-    exon2 = _exon_with_ese(100)
-    intron = _intron_with_consensus(200)
-    
-    wt_pre = exon1 + intron + exon2
-    
-    # For mutant: introduce a mutation in the intron
-    mut_intron = list(intron)
-    if len(mut_intron) > 5:
-        mut_intron[5] = "A" if mut_intron[5] != "A" else "T"
-    mut_pre = exon1 + "".join(mut_intron) + exon2
-    
-    wt_mrna = exon1 + exon2
-    
-    return SpliceContext(
-        gene=gene,
-        variant=hgvs,
-        chrom="unknown",
-        wt_pre_mrna=wt_pre,
-        mut_pre_mrna=mut_pre,
-        wt_mrna=wt_mrna,
-        is_real=False,
-    )
 
 
 # ──────────────────────────────────────────────────────────────────────

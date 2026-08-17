@@ -1,307 +1,329 @@
 # SpliceVarMech
 
-**A Causal Generative Framework for Mechanistic Interpretation of Non-Canonical Splicing Variants in Male Infertility**
+**A Causal Generative Tool for Mechanistic Interpretation of Non-Canonical Splicing Variants**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)]()
 [![PyMC 5.x](https://img.shields.io/badge/PyMC-5.x-orange.svg)]()
 [![PyTorch 2.x](https://img.shields.io/badge/PyTorch-2.x-red.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)]()
+
+> **Paper:** Zein & Hassanien (2026). *SpliceVarMech: a causal generative tool for mechanistic interpretation of non-canonical splicing variants.*
 
 ---
 
-## Overview
+## What is SpliceVarMech?
 
-SpliceVarMech is the first computational framework that combines **discrete sequence diffusion models** with **Bayesian causal inference** for mechanistic interpretation of non-canonical splicing variants (NCSVs). Unlike existing tools that output scores, SpliceVarMech generates the **predicted aberrant mRNA sequence**, identifies the **causal mechanism**, and provides **calibrated uncertainty** — delivering a complete clinical report from variant to ACMG classification.
+SpliceVarMech is the first computational tool that combines **discrete sequence diffusion** (D3PM) with **Bayesian causal inference** to interpret non-canonical splicing variants (NCSVs). Unlike existing tools that output a single score, SpliceVarMech provides:
 
-### Clinical Case
-
-A hemizygous **TEX11 c.1156+16G>T** variant (position +16 in intron) in a male with non-obstructive azoospermia — classified as a VUS because no existing tool can confidently predict whether this deep intronic variant disrupts splicing.
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  MODULE 1: Biological Diffusion Model (D3PM)                │
-│  Dual-stream encoder: WT vs MUT cross-attention comparison  │
-│  → Variant highlight (Gaussian σ=3bp) + substitution embed  │
-│  → Multi-scale CNN (local/regional/structural spliceosome)  │
-│  → Contrastive embedding distance (primary disruption metric│
-│  → D3PM reverse sampling → mechanism classification         │
-│  → EMA-smoothed weights for stable inference                │
-├─────────────────────────────────────────────────────────────┤
-│  MODULE 2: Bayesian Causal Inference (PyMC + MCMC)          │
-│  Takes DIFFUSION FEATURES as primary evidence:              │
-│    contrastive_distance + aberrant_fraction + mechanism     │
-│    + position + variant_type → P(disruption)                │
-│  → No splice tool scores in the Bayesian model              │
-│  → Full MCMC posterior with 95% credible interval           │
-├─────────────────────────────────────────────────────────────┤
-│  MODULE 3: Explainable AI                                   │
-│  Cross-attention attribution, causal paths, ACMG mapping    │
-│  → Clinical report: mechanism + uncertainty + classification │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### End-to-End Pipeline Flow
-
-```
-  VARIANT INPUT (e.g., TEX11 c.1156+16G>T — held-out test case)
-       │
-       ▼
-  ┌─ MODULE 1: Diffusion Model ──────────────────────────┐
-  │  1. Construct WT + mutant pre-mRNA contexts          │
-  │  2. Generate N mRNA samples from mutant context      │
-  │     (D3PM reverse process with self-conditioning)    │
-  │  3. Classify each sample via NW alignment to WT      │
-  │  4. Compute disruption_score (log-likelihood ratio)  │
-  │  5. Compute aberrant_fraction & mechanism probs      │
-  └──────────────────────────────────────────────────────┘
-       │  aberrant_fraction, mechanism, disruption_score
-       ▼
-  ┌─ MODULE 2: Bayesian Inference ───────────────────────┐
-  │  MCMC posterior using diffusion outputs as evidence:  │
-  │    P(disruption | aberrant_frac, mechanism, position) │
-  │  → Posterior mean + 95% credible interval             │
-  └──────────────────────────────────────────────────────┘
-       │  P(disruption) = 0.87 [0.72, 0.95]
-       ▼
-  ┌─ MODULE 3: Clinical Report ──────────────────────────┐
-  │  • Mechanism: exon skipping → frameshift → NMD       │
-  │  • ACMG criteria: PP3_Strong + PS3_Moderate + ...    │
-  │  • Classification: Likely Pathogenic                  │
-  │  • Recommendation: Reclassify VUS → LP               │
-  └──────────────────────────────────────────────────────┘
-```
+1. **Mechanistic prediction** — predicts *what* happens to the mRNA (exon skipping, intron retention, cryptic site activation)
+2. **Calibrated uncertainty** — posterior probabilities with 95% credible intervals via full MCMC inference
+3. **Explainable reports** — maps predictions to ACMG evidence criteria for clinical VUS reclassification
 
 ---
 
-## Quick Start
+## Installation
 
-### Installation
+### Prerequisites
+
+- Python 3.11+
+- GRCh38 reference genome (for hg38 context extraction)
+- GENCODE v44 GTF annotation
+
+### Step 1: Clone and set up environment
 
 ```bash
 git clone https://github.com/Moustafazn/AI-VUS-Mechanism.git
 cd AI-VUS-Mechanism
 
-python3 -m venv venv
-source venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate  # Linux/macOS
+# .venv\Scripts\activate   # Windows
 
 pip install -r requirements.txt
 ```
 
-### External Data Setup
-
-The pipeline uses multiple external data sources for pre-training, training augmentation, and cross-dataset evaluation.
+### Step 2: Download reference data
 
 ```bash
-# 1. GENCODE v44 — real splice junctions for diffusion model pre-training
-wget -P data/external/ https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.annotation.gtf.gz
-gunzip data/external/gencode.v44.annotation.gtf.gz
-wget -P data/external/ https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/GRCh38.primary_assembly.genome.fa.gz
+mkdir -p data/external
+
+# GRCh38 reference genome
+wget -P data/external/ \
+  https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/GRCh38.primary_assembly.genome.fa.gz
 gunzip data/external/GRCh38.primary_assembly.genome.fa.gz
 
-# 2. gnomAD v4.1 — benign intronic negatives for training augmentation
-#    Uses gnomAD GraphQL API — no large VCF downloads needed (~2-5 minutes)
-python scripts/fetch_gnomad_api.py
+# GENCODE v44 annotation
+wget -P data/external/ \
+  https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.annotation.gtf.gz
+gunzip data/external/gencode.v44.annotation.gtf.gz
 
-# 3. MFASS — 27,733 experimentally tested splice variants (cross-dataset eval)
-curl -L -o data/external/mfass_snv_data_clean.txt \
-  "https://raw.githubusercontent.com/KosuriLab/MFASS/master/processed_data/snv/snv_data_clean.txt"
-
-# 4. ClinVar — clinically classified splice variants (training augmentation)
-wget -P data/external/ https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/variant_summary.txt.gz
-
-# 5. BRCA1 SGE — saturation genome editing (cross-dataset evaluation)
-curl -L -o data/external/brca1_sge_findlay2018.xlsx \
-  "https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-018-0461-z/MediaObjects/41586_2018_461_MOESM3_ESM.xlsx"
-
-# 6. MaPSy — massively parallel splicing assay (cross-dataset evaluation)
-curl -L -o data/external/mapsy_soemedi2017.xlsx \
-  "https://static-content.springer.com/esm/art%3A10.1038%2Fng.3837/MediaObjects/41588_2017_BFng3837_MOESM2_ESM.xlsx"
+# Index the FASTA (requires samtools)
+samtools faidx data/external/GRCh38.primary_assembly.genome.fa
 ```
 
-> **Note:** GENCODE and gnomAD are auto-detected. When present, the pipeline uses real data. When absent, it shows download instructions.
+### Step 3: Download the primary dataset
 
-### Tissue-Conditioned Generation
+The gold-standard dataset from:
 
-The model supports tissue-specific splice prediction via a learned tissue embedding. Set the default tissue in `config.yaml`:
+> Li K, Chen Y, Tang D, et al. *Mapping the Non-Canonical Splicing Variants: Decrypting the Hidden Genetic Architecture of Idiopathic Male Infertility.* Advanced Science. 2026. DOI: [10.1002/advs.202315512](https://doi.org/10.1002/advs.202315512)
 
-```yaml
-tissue:
-  default: "testis"  # Options: universal, testis, brain, liver, heart, muscle, blood, kidney, lung, ovary
+```bash
+# Download the supplementary Excel file and place in data/raw/
+# File: ADVS-13-e15512-s001.xlsx
+# Available from the journal's supplementary materials page
 ```
 
-During inference, specify tissue type:
+### Step 4: Verify installation
+
+```bash
+python main.py
+```
+
+This prints the module status and available commands.
+
+---
+
+## Quick Start
+
+### Run the complete pipeline
+
+```bash
+# Full pipeline (all phases sequentially)
+python main.py --all
+```
+
+### Run individual phases
+
+```bash
+python main.py --phase 1    # Parse dataset
+python main.py --phase 2    # Splice tool feature analysis
+python main.py --phase 3    # Bayesian causal model diagnostics
+python main.py --phase 4    # Training (pre-training + fine-tuning)
+python main.py --phase 5    # TEX11 prediction + clinical report
+```
+
+### Evaluation
+
+```bash
+python main.py --loo         # Leave-one-out cross-validation (N=31)
+python main.py --baselines   # Evaluate 16 baseline tools
+python main.py --spliceai    # SpliceAI head-to-head comparison
+python main.py --ablation    # Ablation studies (4 experiments)
+python main.py --xai         # Explainable AI analysis
+python main.py --benchmark   # SOTA literature benchmarking
+```
+
+### Generate paper figures and tables
+
+```bash
+python scripts/generate_figures.py   # 5 main + 3 supplementary figures
+python scripts/generate_tables.py    # All supplementary tables (CSV + LaTeX)
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  MODULE 1: Biological Diffusion Model (D3PM)             │
+│  • Variant highlight (Gaussian σ=3bp, substitution embed)│
+│  • Multi-scale CNN (kernels 5/15/51 for spliceosome)     │
+│  • Dual-stream encoder (WT vs MUT cross-attention)       │
+│  • Contrastive learning (WT/MUT separation)              │
+│  • D3PM reverse sampling → mechanism classification      │
+│  • ~9.2M parameters                                      │
+├─────────────────────────────────────────────────────────┤
+│  MODULE 2: Bayesian Causal Inference (PyMC + NUTS)       │
+│  • Structural causal model (V→S, V→E, V→I pathways)     │
+│  • Diffusion features as primary evidence                │
+│  • Full MCMC posterior with 95% credible intervals       │
+│  • Class-balanced weighted likelihood                    │
+├─────────────────────────────────────────────────────────┤
+│  MODULE 3: Explainable AI + Clinical Report              │
+│  • Sequence attribution maps                             │
+│  • Causal path analysis                                  │
+│  • ACMG evidence mapping → VUS reclassification          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Two-Stage Training
+
+1. **Stage 1 (Pre-training):** Learn splicing grammar from 252,835 GENCODE v44 splice junctions
+2. **Stage 2 (Fine-tuning):** Adapt to variant effects using gold-standard NCSVs + augmentation data
+
+---
+
+## Using the Pre-trained Model
+
+### Load and use the pre-trained model for inference
+
 ```python
-from src.diffusion.sampling import SpliceSampler
-sampler = SpliceSampler(model)
-samples = sampler.generate_samples(context, tissue="testis")
-```
+import torch
+from src.config import get_diffusion_config, get_device
+from src.diffusion.model import BiologicalDiffusionModel, tokenize_sequence, VOCAB
 
-### Run Full Pipeline (Production)
+# Load model
+config = get_diffusion_config()
+device = get_device()
+model = BiologicalDiffusionModel(config)
 
-```bash
-python main.py --all            # Run all phases with the required settings
-```
+# Load checkpoint
+ckpt = torch.load("experiments/checkpoints/splice_diffusion_model.pt",
+                   map_location=device, weights_only=False)
+model.load_state_dict(ckpt["model_state_dict"])
+model.to(device).eval()
 
-### Run Individual Phases
+# Score a variant using contrastive distance
+from src.data.hg38_context import extract_splice_context
 
-```bash
-python main.py --phase 1        # Parse primary dataset (2,404 variants)
-python main.py --phase 2        # Splice tool coverage analysis
-python main.py --phase 3        # Bayesian model diagnostics
-python main.py --phase 4        # Training (production: 20 epochs pre-train, 30 fine-tune)
-python main.py --phase 5        # TEX11 prediction + clinical report (full MCMC)
-python main.py --baselines      # 17-tool baseline evaluation (AUROC/AUPRC)
-python main.py --spliceai       # SpliceAI head-to-head evaluation
-python main.py --loo            # Leave-one-out cross-validation
-python main.py --ablation       # Run ablation studies (actual execution)
-python main.py --eval           # Comprehensive evaluation (leakage, calibration, cross-dataset)
-python main.py --ablation --id 2  # Run specific ablation (#2: Bayesian only)
-python main.py --xai            # Explainability analysis (cross-attention)
-python main.py --benchmark      # SOTA benchmarking (2019-2026 literature)
+ctx = extract_splice_context("TEX11", "c.1156+16G>T")
+wt_tok = tokenize_sequence(ctx.wt_pre_mrna, config.max_seq_len).unsqueeze(0).to(device)
+mut_tok = tokenize_sequence(ctx.mut_pre_mrna, config.max_seq_len).unsqueeze(0).to(device)
+
+# Find variant position
+var_pos = 0
+for i in range(min(len(ctx.wt_pre_mrna), len(ctx.mut_pre_mrna))):
+    if ctx.wt_pre_mrna[i] != ctx.mut_pre_mrna[i]:
+        var_pos = i
+        break
+
+vpos = torch.tensor([min(var_pos, config.max_seq_len - 1)], device=device)
+ref_t = torch.tensor([VOCAB[ctx.wt_pre_mrna[var_pos]]], device=device)
+alt_t = torch.tensor([VOCAB[ctx.mut_pre_mrna[var_pos]]], device=device)
+
+with torch.no_grad():
+    result = model.compute_contrastive_distance(wt_tok, mut_tok, vpos, ref_t, alt_t)
+    print(f"Contrastive distance: {result['contrastive_distance']:.4f}")
+    # High distance (>0.1) = likely disruptive
+    # Low distance (<0.05) = likely benign
 ```
 
 ---
 
-## Training
+## Fine-tuning for a New Disease Domain
 
-### Defaults
+SpliceVarMech's pre-trained model captures general splicing grammar that can be adapted to **any disease domain** through fine-tuning. The key principle: **same architecture, same training procedure, different data.**
 
-Running `python main.py --phase 4` trains the full model with the required settings:
-
-| Setting | Value |
-|---------|-------|
-| **Model** | d_model=256, n_heads=8, n_layers=6, d_ff=1024, Pre-LayerNorm |
-| **Diffusion** | 100 timesteps, cosine schedule, self-conditioning (Sahoo et al. 2024) |
-| **Sampling** | Proper D3PM reverse transitions, vectorized, non-nucleotide masking |
-| **Parameters** | ~9.2M trainable |
-| **Pre-training** | 100K GENCODE splice junctions (or synthetic fallback), 10 epochs |
-| **Fine-tuning** | Gold-standard + Study 6 + augmentation, 20 epochs |
-| **Regularization** | EMA (decay=0.9999), validation split (15%), early stopping (patience=10) |
-| **Scheduler** | Linear warmup (100 steps) → cosine annealing |
-| **Device** | Auto-detected (CUDA → MPS → CPU) |
-
-### GENCODE Pre-training (Recommended)
-
-For best results, pre-train on real human splice junctions from GENCODE:
-
-1. Download the files:
-   ```bash
-   # GENCODE v44 annotation
-   wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.annotation.gtf.gz
-   gunzip gencode.v44.annotation.gtf.gz
-
-   # GRCh38 reference genome
-   wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/GRCh38.primary_assembly.genome.fa.gz
-   gunzip GRCh38.primary_assembly.genome.fa.gz
-   ```
-
-2. Place them in `data/external/`:
-   ```
-   data/external/gencode.v44.annotation.gtf
-   data/external/GRCh38.primary_assembly.genome.fa
-   ```
-
-3. Install FASTA access library:
-   ```bash
-   pip install pysam    # or: pip install pyfaidx
-   ```
-
-4. Run training — GENCODE is **auto-detected**:
-   ```bash
-   python main.py --phase 4
-   ```
-
-The trainer automatically searches `data/external/` for GENCODE GTF and reference FASTA files. When found, it extracts up to 100,000 real exon-intron-exon splice junctions for pre-training instead of synthetic data.
-
-### Checkpoints
-
-Trained models are saved to `experiments/checkpoints/splice_diffusion_model.pt` and automatically used by Phase 5 (prediction) and ablation studies.
-
----
-
-## Ablation Studies
-
-Running `python main.py --ablation` **executes** ablation experiments:
-
-| # | Ablation | What's Removed | Tests |
-|---|----------|----------------|-------|
-| 1 | Diffusion Only | Bayesian causal model | Does causal reasoning improve over generation alone? |
-| 2 | Bayesian Only | Diffusion model | Does the diffusion model add value over tool scores? |
-| 3 | No External Data | Study 6 variants | Does external data augmentation help? |
-| 4 | **No Pre-training** | GENCODE Stage 1 (252K junctions) | Does pre-training on normal splicing help? |
-| 5 | No Class Balancing | Balanced weights | How critical is class balancing? |
-| 6 | No Shrinkage Prior | Hierarchical prior | Does regularization prevent overfitting? |
+### Example: Adapting to BRCA1 (breast cancer) variants
 
 ```bash
-python main.py --ablation           # Run all ablations
-python main.py --ablation --id 4    # Without GENCODE pre-training (pretrained vs scratch)
+python scripts/brca1_domain_finetune.py
 ```
 
+This script:
+1. Loads BRCA1 SGE variants (Findlay et al., Nature 2018)
+2. Splits 80/20 stratified train/test
+3. Loads the **pre-trained** checkpoint (not the male-infertility-tuned one)
+4. Fine-tunes using the identical procedure (diffusion + contrastive loss, EMA, cosine LR)
+5. Evaluates before and after fine-tuning
 
-## Evaluation Suite
+### Adapting to your own disease domain
 
-Running `python main.py --eval` executes a comprehensive evaluation addressing top-tier publication standards:
+To fine-tune SpliceVarMech on your own variants:
 
-| Metric | What It Tests | Status |
-|--------|--------------|--------|
-| **Formal Leakage Analysis** | Verify no information leakage between features and labels | ✅ |
-| **Calibration (ECE)** | Expected Calibration Error + reliability diagrams | ✅ |
-| **Per-Mechanism Metrics** | Performance stratified by variant type (Mis/Intron/Syn) | ✅ |
-| **Cold-Gene Evaluation** | Leave-One-Gene-Out CV for unseen gene generalization | ✅ |
-| **Feature-Group Ablation** | Isolate contribution of each feature category | ✅ |
-| **Cross-Dataset Testing** | Train on primary → test on Study 6/Study 4 (independent cohorts) | ✅ |
-| **XAI Stability** | Rank correlation of attributions across seeds/bootstraps | ✅ |
-| **Component Training** | Document frozen vs fine-tuned components | ✅ |
+1. **Prepare your data** as a list of `PairedSpliceExample` objects:
 
-### Cross-Dataset Generalization
+```python
+from src.diffusion.training import PairedSpliceExample
+from src.data.hg38_context import extract_splice_context
 
-| Train Set | Test Set | Type |
-|-----------|----------|------|
-| S7+S2 (primary) | S7+S2 (LOO-CV) | In-distribution |
-| S7+S2 (primary) | Study 6 genes | Cross-cohort |
-| S7+S2 (primary) | Study 4 TESE outcomes | Cross-outcome |
-| S7+S2 + ClinVar | BRCA1 SGE (3,644 variants) | **Cross-dataset (independent gene)** |
-| S7+S2 + ClinVar | MaPSy (231 variants) | **Cross-dataset (independent assay)** |
+examples = []
+for variant in your_variants:
+    ctx = extract_splice_context(variant.gene, variant.hgvs)
+    if ctx and ctx.is_real:
+        examples.append(PairedSpliceExample(
+            wt_pre_mrna=ctx.wt_pre_mrna,
+            mut_pre_mrna=ctx.mut_pre_mrna,
+            variant_pos=find_diff_pos(ctx.wt_pre_mrna, ctx.mut_pre_mrna),
+            ref_allele=ctx.wt_pre_mrna[var_pos],
+            alt_allele=ctx.mut_pre_mrna[var_pos],
+            target_mrna=ctx.wt_mrna,
+            label=variant.label,  # 0=benign, 1=pathogenic
+            mechanism="normal" if variant.label == 0 else "exon_skipping",
+        ))
+```
 
-### External Data Sources
+2. **Fine-tune using `SpliceTrainer`:**
 
-| Dataset | Variants | Source | Use |
-|---------|----------|--------|-----|
-| **GENCODE v44** | 252K splice junctions | GENCODE | Pre-training (Stage 1) ✅ |
-| **gnomAD v4.1** | ~1,000+ benign intronic (AF>1%) | Google Cloud | Training augmentation (benign negatives) ✅ |
-| **ClinVar** | 394,686 splice variants | NCBI variant_summary.txt.gz | Training augmentation ✅ |
-| **MFASS** | 27,733 variants (13,875 near-canonical ±3-20) | Cheung et al., Mol Cell 2019 | Cross-dataset evaluation ✅ |
-| **BRCA1 SGE** | 3,644 variants (823 LOF + 2,821 FUNC) | Findlay et al., Nature 2018 | Cross-dataset evaluation ✅ |
-| **MaPSy** | 231 variants (8 ESM + 223 non-ESM) | Soemedi et al., Nat Gen 2017 | Cross-dataset evaluation ✅ |
-| **GTEx v8** | 55,374 genes × 54 tissues | GTEx Portal | Tissue-specific expression ✅ |
+```python
+from src.config import get_diffusion_config, get_training_config
+from src.diffusion.model import BiologicalDiffusionModel
+from src.diffusion.training import SpliceTrainer, TrainingConfig
+
+# Load pre-trained model
+config = get_diffusion_config()
+model = BiologicalDiffusionModel(config)
+ckpt = torch.load("experiments/checkpoints/splice_diffusion_pretrain.pt",
+                   map_location="cpu", weights_only=False)
+model.load_state_dict(ckpt["model_state_dict"])
+
+# Configure fine-tuning
+train_config = TrainingConfig(
+    pretrain_epochs=0,        # Skip pre-training (already done)
+    pretrain_samples=0,
+    finetune_epochs=30,       # Same as male infertility
+    finetune_batch_size=8,
+    finetune_lr=5e-5,
+    save_dir="experiments/checkpoints/your_domain",
+    device="mps",  # or "cuda" or "cpu"
+)
+
+trainer = SpliceTrainer(model, train_config)
+trainer.finetune()  # Uses your domain data
+trainer.save_checkpoint()
+```
+
+3. **Evaluate with LOO-CV:**
+
+```bash
+python main.py --loo
+```
 
 ---
 
-## Dataset
+## For Clinical Labs: Male Infertility VUS Testing
 
-### Primary Data
+### Setting up SpliceVarMech in your lab
 
-| Table | Content | Records | Role |
-|-------|---------|---------|------|
-| **S1** | Curated pathogenic variants | 2,404 × 63 | Feature matrix (17 splice tool scores) |
-| **S2** | Negative controls (experimentally normal) | 14 usable | Gold-standard negatives |
-| **S7** | Validated NCSVs with aberrant mRNA | 40 variants | Gold-standard positives + diffusion targets |
-| **S3** | Patient-level variants | 58 × 95 | Biological context |
-| **S4** | Clinical semen analysis | 13 patients | Phenotype correlation |
-| **S5** | Extended variant landscape | 6,310 × 101 | Broader context |
+1. **Install** following the instructions above
+2. **Download** the pre-trained + fine-tuned model checkpoint:
+   - `experiments/checkpoints/splice_diffusion_model.pt` (fine-tuned on male infertility NCSVs)
 
-**Source:** *"Mapping the Non-Canonical Splicing Variants"*, Advanced Science, 2024.
+3. **Run a prediction** (example TEX11 case):
 
-### External Data (Literature Integration)
+```bash
+python main.py --phase 5
+```
 
-| Study | Data | Examples | Use |
-|-------|------|----------|-----|
-| Study 6 (Splice defects in infertility) | 341 splice variants + SpliceAI/CADD | 183 positives added | Training augmentation |
-| Study 4 (TESE outcomes, n=571) | 326 variants + TESE outcome | 50 negatives added | Evaluation + weak negatives |
-| RBP Table 1 (RNA-binding proteins) | 8 TEX11 + 11 splice-affecting variants | Hardcoded | XAI validation |
+This generates a clinical report including:
+- Disruption probability with 95% CI
+- Mechanism prediction (exon skipping / intron retention / cryptic site)
+- ACMG evidence mapping (PP3, PS3, PM2)
+- Confidence grade (High / Moderate / Low)
 
-**Combined training data:** 284 examples (before augmentation), ~1,900+ with augmentation.
+4. **Score your own variant:**
+
+```python
+from src.pipeline.predict import run_tex11_prediction
+from src.config import get_diffusion_config, get_device
+
+report = run_tex11_prediction(
+    n_samples=200,
+    model_config=get_diffusion_config(),
+    device=get_device(),
+)
+print(report)
+```
+
+### Interpreting results
+
+| Posterior P(disruption) | ACMG Evidence | Clinical Action |
+|:---:|:---:|---|
+| > 0.85 | PP3_Strong | Likely Pathogenic — report to clinician |
+| 0.50–0.85 | PP3_Moderate | VUS — additional evidence recommended |
+| < 0.30 | BP4_Supporting | Likely Benign — low priority |
+| CI width > 0.30 | Insufficient | Inconclusive — more data needed |
 
 ---
 
@@ -309,130 +331,64 @@ Running `python main.py --eval` executes a comprehensive evaluation addressing t
 
 ```
 AI-VUS-Mechanism/
-├── main.py                            # Unified CLI entry point (all phases)
-├── config.yaml                        # Central configuration (model, training, data paths)
-├── README.md                          # This file
-├── requirements.txt                   # Python dependencies
-├── pyproject.toml                     # Project configuration
-│
-├── data/
-│   ├── raw/ADVS-13-e15512-s001.xlsx   # Primary dataset
-│   ├── external/                      # GENCODE, gnomAD, MFASS, BRCA1 SGE, MaPSy, ClinVar
-│   └── processed/                     # Parsed outputs
-│
-├── scripts/
-│   └── fetch_gnomad_api.py            # gnomAD v4.1 GraphQL API fetcher (benign negatives)
-│                                      #   Exponential backoff, 190 genes, ~2K variants
-│
+├── main.py                          # Unified entry point
+├── config.yaml                      # Model & training configuration
+├── requirements.txt                 # Python dependencies
 ├── src/
-│   ├── config.py                      # Configuration loader (reads config.yaml)
-│   ├── data/
-│   │   ├── parser.py                  # Primary dataset parser (S1/S2/S3-S8)
-│   │   ├── external_parser.py         # Study 6 + Study 4 literature data parser
-│   │   ├── clinvar.py                 # ClinVar splice variant parser + augmented training
-│   │   ├── gnomad.py                  # gnomAD v4.1 benign negatives loader
-│   │   ├── mfass.py                   # MFASS splice assay (27,733 variants, Cheung 2019)
-│   │   ├── brca1_sge.py              # BRCA1 SGE (3,644 variants, Findlay Nature 2018)
-│   │   ├── mapsy.py                   # MaPSy (231 variants, Soemedi Nat Gen 2017)
-│   │   ├── hg38_context.py           # GRCh38 genomic context extraction (real exon-intron)
-│   │   └── gtex.py                    # GTEx v8 tissue-specific expression mapper
-│   ├── features/
-│   │   └── splice_scores.py           # 16-tool splice score analysis + coverage
-│   ├── causal/
-│   │   ├── dag.py                     # Bayesian causal model (diffusion-integrated SCM)
-│   │   ├── diagnostics.py            # Class imbalance investigation
-│   │   └── loo_cv.py                  # Leave-one-out cross-validation
 │   ├── diffusion/
-│   │   ├── model.py                   # D3PM architecture (~9.2M params, Pre-LayerNorm)
-│   │   ├── training.py                # Pre-train + fine-tune pipeline (GENCODE auto-detect)
-│   │   └── sampling.py               # D3PM reverse sampling + mechanism classification
-│   ├── pipeline/
-│   │   └── predict.py                 # End-to-end TEX11 prediction + clinical report
+│   │   ├── model.py                 # BiologicalDiffusionModel (D3PM)
+│   │   ├── training.py              # SpliceTrainer (two-stage pipeline)
+│   │   └── sampling.py              # D3PM reverse sampling
+│   ├── causal/
+│   │   ├── dag.py                   # Bayesian structural causal model
+│   │   ├── loo_cv.py                # Leave-one-out cross-validation
+│   │   └── diagnostics.py           # MCMC convergence diagnostics
+│   ├── baselines/
+│   │   ├── ablation.py              # Ablation studies (4 experiments)
+│   │   ├── generalization.py        # Cross-dataset evaluation
+│   │   └── sota_benchmark.py        # SOTA comparison
+│   ├── data/
+│   │   ├── hg38_context.py          # Real genomic context extraction
+│   │   ├── brca1_sge.py             # BRCA1 SGE data loader
+│   │   └── parser.py                # Primary dataset parser
 │   ├── xai/
-│   │   └── attribution.py            # Cross-attention attribution + causal paths
-│   └── baselines/
-│       ├── tool_evaluation.py         # 17-tool AUROC/AUPRC evaluation
-│       ├── spliceai_evaluation.py     # SpliceAI head-to-head (eval only)
-│       ├── ablation.py                # 6 ablation experiments (actual execution)
-│       ├── evaluation_metrics.py      # Comprehensive eval (leakage, calibration, cross-dataset)
-│       └── benchmark.py              # SOTA benchmarking (2019-2026 literature)
-│
-├── notebooks/
-│   ├── base_proposal.md               # Full project proposal
-│   └── model_documentation.md         # Comprehensive model documentation
-│
-├── tests/
-│   └── test_parser.py                 # 29 validation tests
-│
-├── experiments/                       # Training checkpoints + ablation outputs
-├── figures/                           # Generated figures
-└── paper/                             # Manuscript drafts
-```
-
----
-
-## Key Results
-
-### Why Diffusion > Tool Scores
-
-Tool scores alone cannot reliably separate true NCSVs from false positives — the negatives were selected *because* tools flagged them (selection bias). The diffusion model provides **sequence-level evidence** that goes beyond aggregate scores by actually generating the predicted mRNA and classifying the splice mechanism.
-
-### TEX11 Validation (Held-Out Test Case)
-
-TEX11 c.1156+16G>T is **not in the training data** — it is the clinical case study used exclusively for testing. Independently confirmed as causative by:
-- **Study 4**: 4/4 TEX11 variants → TESE-negative (no sperm)
-- **Study 7**: TEX11 listed among 5 confirmed NOA causative genes
-- **RBP Table 1**: 8 pathogenic TEX11 variants including 2 splice-disrupting
-
----
-
-## Dependencies
-
-```
-openpyxl>=3.1.0     # Excel parsing
-pandas>=2.0.0       # Data manipulation
-numpy>=1.24.0       # Numerical computing
-pymc>=5.0.0         # Bayesian inference (MCMC)
-arviz>=0.15.0       # MCMC diagnostics
-scipy>=1.10.0       # Statistical tests
-torch>=2.0.0        # Deep learning (diffusion model)
-einops>=0.7.0       # Tensor operations
-scikit-learn>=1.3.0  # Evaluation metrics
-pytest>=7.0.0       # Testing
-```
-
-Optional for GENCODE pre-training:
-```
-pysam>=0.22.0       # FASTA access (recommended)
-pyfaidx>=0.7.0      # FASTA access (alternative)
+│   │   └── attribution.py           # Explainable AI analysis
+│   └── pipeline/
+│       └── predict.py               # TEX11 prediction pipeline
+├── scripts/
+│   ├── brca1_domain_finetune.py     # BRCA1 domain adaptation
+│   ├── generate_figures.py          # Paper figures
+│   └── generate_tables.py           # Paper tables
+├── experiments/
+│   ├── checkpoints/                 # Trained model weights
+│   └── results/                     # JSON experimental results
+├── paper/
+│   ├── article.tex                  # Manuscript (Cell Press format)
+│   ├── figures/                     # Generated figures (PDF)
+│   └── supplementary_tables/        # Generated tables (CSV + LaTeX)
+└── data/
+    ├── raw/                         # Primary dataset (Excel)
+    └── external/                    # GRCh38 FASTA, GENCODE GTF
 ```
 
 ---
 
 ## Citation
 
-If you use this framework, please cite:
-
 ```bibtex
-@article{splicevarmech2026,
-  title={SpliceVarMech: A Causal Generative Framework for Mechanistic
-         Interpretation of Non-Canonical Splicing Variants in Male Infertility},
+@article{zein2026splicevarmech,
+  title={SpliceVarMech: a causal generative tool for mechanistic interpretation 
+         of non-canonical splicing variants},
   author={Zein, Moustafa and Hassanien, Aboul Ella},
-  year={2026},
-  note={Manuscript in preparation}
+  year={2026}
 }
 ```
 
-### Key References
-
-- Primary dataset: *"Mapping the Non-Canonical Splicing Variants"*, Advanced Science, 2024
-- D3PM: Austin et al., NeurIPS 2021
-- SpliceAI: Jaganathan et al., Cell 2019
-- Bayesian causal inference: Pearl, *Causality*, 2009
-- See `notebooks/base_proposal.md` Section 12 for complete reference list
-
----
-
 ## License
 
-This project is for academic research purposes.
+This project is licensed under the MIT License.
+
+## Contact
+
+- **Moustafa Zein** — [moustafazn@gmail.com](mailto:moustafazn@gmail.com)
+- Faculty of Computers and AI, Cairo University

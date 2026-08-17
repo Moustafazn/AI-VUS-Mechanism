@@ -381,53 +381,66 @@ def analyze_causal_paths(
     """
     analysis = CausalPathAnalysis()
 
-    # Position-based path priors
+    # Use Bayesian model coefficients if available (computed from data)
+    if bayesian_coefficients and "path_strengths" in bayesian_coefficients:
+        strengths = bayesian_coefficients["path_strengths"]
+        # Map Bayesian coefficient names to causal path variables
+        for path_name, strength in strengths.items():
+            if "V → S" in path_name or "V → P" in path_name:
+                analysis.path_V_S_O = strength
+            elif "V → E" in path_name:
+                analysis.path_V_E_O = strength
+            elif "V → I" in path_name:
+                analysis.path_V_I_O = strength
+            elif "V → R" in path_name:
+                analysis.path_V_R_O = strength
+            elif "V → D" in path_name or "V → M" in path_name:
+                analysis.path_V_D_O = strength
+    elif bayesian_coefficients and "betas_mean" in bayesian_coefficients:
+        # Use raw coefficient magnitudes from the Bayesian model
+        betas = bayesian_coefficients["betas_mean"]
+        feature_names = bayesian_coefficients.get("feature_names", [])
+        # Map features to paths based on feature names
+        for i, name in enumerate(feature_names):
+            if i < len(betas):
+                coef = abs(float(betas[i]))
+                if "position" in name or "abs_position" in name:
+                    analysis.path_V_S_O += coef
+                elif "ese" in name.lower() or "exonic" in name.lower() or "missense" in name.lower():
+                    analysis.path_V_E_O += coef
+                elif "intronic" in name.lower() or "ise" in name.lower():
+                    analysis.path_V_I_O += coef
+                elif "diffusion" in name.lower() or "contrastive" in name.lower() or "aberrant" in name.lower():
+                    analysis.path_V_D_O += coef
+                elif "mechanism" in name.lower():
+                    analysis.path_V_D_O += coef
+    else:
+        # No Bayesian coefficients available — raise error
+        raise RuntimeError(
+            "Causal path analysis requires Bayesian model coefficients. "
+            "Run the Bayesian causal model first (Phase 3) to compute coefficients, "
+            "then pass them via the bayesian_coefficients parameter."
+        )
+
+    # Determine disrupted element from position
     if variant_type == "intronic" or variant_position != 0:
         abs_pos = abs(variant_position)
         if abs_pos <= 2:
-            # Canonical splice site → V → S → O is dominant
-            analysis.path_V_S_O = 0.80
-            analysis.path_V_I_O = 0.10
-            analysis.path_V_R_O = 0.05
-            analysis.path_V_E_O = 0.05
             analysis.disrupted_element = "canonical splice site (GT/AG)"
             analysis.element_type = "splice_site"
         elif abs_pos <= 6:
-            # Extended donor → V → S → O still dominant
-            analysis.path_V_S_O = 0.60
-            analysis.path_V_I_O = 0.25
-            analysis.path_V_R_O = 0.10
-            analysis.path_V_E_O = 0.05
             analysis.disrupted_element = "extended donor consensus (+3 to +6)"
             analysis.element_type = "splice_site"
         elif abs_pos <= 20:
-            # ISE/ISS region → V → I → O is dominant
-            analysis.path_V_I_O = 0.55
-            analysis.path_V_R_O = 0.20
-            analysis.path_V_S_O = 0.15
-            analysis.path_V_E_O = 0.10
             analysis.disrupted_element = f"ISE motif at +{abs_pos - 2} to +{abs_pos + 2}"
             analysis.element_type = "ISE"
             analysis.element_position = f"+{abs_pos - 2} to +{abs_pos + 2}"
         else:
-            # Deep intronic → V → R → O or V → I → O
-            analysis.path_V_R_O = 0.40
-            analysis.path_V_I_O = 0.30
-            analysis.path_V_S_O = 0.20
-            analysis.path_V_E_O = 0.10
             analysis.disrupted_element = "deep intronic regulatory element"
             analysis.element_type = "ISS"
     else:
-        # Exonic variant → V → E → O is dominant (ESE/ESS disruption)
-        analysis.path_V_E_O = 0.60
-        analysis.path_V_S_O = 0.20
-        analysis.path_V_I_O = 0.10
-        analysis.path_V_R_O = 0.10
         analysis.disrupted_element = "exonic splicing enhancer (ESE)"
         analysis.element_type = "ESE"
-
-    # Diffusion model path (always contributes)
-    analysis.path_V_D_O = 0.15  # Base contribution from diffusion output
 
     # Normalize to sum to 1
     total = (analysis.path_V_S_O + analysis.path_V_E_O + analysis.path_V_I_O +
@@ -596,6 +609,7 @@ def run_xai_analysis(
     ci_width: float = 0.20,
     n_samples: int = 100,
     verbose: bool = True,
+    bayesian_coefficients: Optional[dict] = None,
 ) -> XAIReport:
     """
     Run complete XAI analysis for a variant prediction.
@@ -627,6 +641,7 @@ def run_xai_analysis(
         variant_position=variant_position,
         variant_type=variant_type,
         attribution=attribution,
+        bayesian_coefficients=bayesian_coefficients,
     )
 
     if verbose:
