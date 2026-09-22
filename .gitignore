@@ -63,6 +63,8 @@ lightning_logs/
 # ── Paper & results (keep locally, not in repo) ──
 paper/
 TEX11_Clinical_Action_Plan.*
+src/pipeline/predict.py
+scripts/tex11_case_study.py
 
 # ── OS files ──
 .DS_Store

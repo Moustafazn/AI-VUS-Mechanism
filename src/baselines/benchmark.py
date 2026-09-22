@@ -674,7 +674,7 @@ def run_benchmark_comparison(
   5. TRAINING DATA:
      DNABERT-2 pre-trained on multi-species genomes (billions of tokens).
      Evo trained on 300B nucleotides.
-     Our pre-training: synthetic splice junctions (planned: GENCODE v44).
+     Our pre-training: 252K GENCODE v44 splice junctions from GRCh38.
      Foundation model pre-training would improve our diffusion backbone.
 """)
 

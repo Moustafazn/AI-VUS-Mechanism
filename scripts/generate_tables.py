@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SpliceVarMech — Supplementary Tables Generator
-Target Journal: Molecular Cell (Cell Press)
+SpliceVarMech — Supplementary Tables Generator
 
 Generates supplementary tables from experiments/results/*.json
 Outputs: CSV files + LaTeX tables for the manuscript
@@ -624,7 +624,7 @@ def table_s11_sota_benchmark():
 def main():
     print("=" * 70)
     print("SpliceVarMech — Supplementary Tables Generator")
-    print("Target: Molecular Cell (Cell Press)")
+    print("SpliceVarMech — Supplementary Tables")
     print("=" * 70)
     print(f"\n  Results dir: {RESULTS_DIR}")
     print(f"  Output dir:  {TABLES_DIR}\n")

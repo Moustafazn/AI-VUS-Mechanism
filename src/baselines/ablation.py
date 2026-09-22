@@ -303,7 +303,7 @@ def run_ablation_no_pretraining(features_list, verbose=True):
 
             model = BiologicalDiffusionModel(diff_config)
             train_config = TrainingConfig(
-                pretrain_epochs=0, pretrain_samples=0,
+                pretrain_epochs=0,
                 finetune_epochs=min(base_cfg.finetune_epochs, 10),
                 finetune_batch_size=base_cfg.finetune_batch_size,
                 finetune_lr=base_cfg.finetune_lr,

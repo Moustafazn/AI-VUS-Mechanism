@@ -48,7 +48,7 @@ def main():
     test_variants = pos[n_pt:] + neg[n_nt:]
 
     # ── Step 3: Build PairedSpliceExamples from BRCA1 data ──
-    print("\n[Step 3] Building training examples with real hg38 contexts...")
+    print("\n[Step 3] Building training examples with hg38 contexts...")
     from src.data.hg38_context import extract_splice_context
     from src.diffusion.training import PairedSpliceExample
 
@@ -88,7 +88,7 @@ def main():
                 mechanism=mech,
             ))
         if n_skip:
-            print(f"    {label_name}: skipped {n_skip} variants (no real hg38 context)")
+            print(f"    {label_name}: skipped {n_skip} variants (no hg38 context)")
         return examples
 
     train_examples = build_examples(train_variants, "Train")
@@ -132,7 +132,7 @@ def main():
     print("\n[Step 6] Fine-tuning with SpliceTrainer (IDENTICAL to male infertility)...")
     base_cfg = get_training_config()
     train_config = TrainingConfig(
-        pretrain_epochs=0, pretrain_samples=0,   # Skip pre-training
+        pretrain_epochs=0,   # Skip pre-training
         finetune_epochs=base_cfg.finetune_epochs,  # Same epochs as main
         finetune_batch_size=base_cfg.finetune_batch_size,
         finetune_lr=base_cfg.finetune_lr,

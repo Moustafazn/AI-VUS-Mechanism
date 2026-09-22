@@ -2,6 +2,10 @@
 
 **A Causal Generative Tool for Mechanistic Interpretation of Non-Canonical Splicing Variants**
 
+## Abstract
+
+Variants of uncertain significance (VUS) in splice-regulatory regions constitute a major bottleneck in clinical genetics. Existing tools predict splice disruption as a single score without explaining the underlying mechanism or quantifying confidence. Here we present SpliceVarMech, a computational tool that integrates discrete sequence diffusion (D3PM) with Bayesian causal inference to provide mechanistic interpretation of non-canonical splicing variants (NCSVs). A dual-stream encoder with cross-attention explicitly compares wild-type and mutant pre-mRNA contexts, while a structural causal model with full MCMC posterior inference yields calibrated disruption probabilities with 95% credible intervals. On experimentally validated NCSVs from male infertility genes, SpliceVarMech achieves an AUROC of 1.000 and balanced accuracy of 1.000 in leave-one-out cross-validation, substantially outperforming SpliceAI (AUROC 0.619) and 16 baseline tools. Ablation analysis confirms that all four components—pre-training, contrastive learning, diffusion features, and domain-specific fine-tuning—are individually necessary. Cross-domain fine-tuning on BRCA1 saturation genome editing variants, using the identical training procedure, achieves AUROC 0.840, demonstrating that the architecture captures transferable splicing grammar adaptable to new disease contexts. The tool maps predictions to ACMG evidence criteria, enabling principled VUS reclassification with quantified uncertainty.
+
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)]()
 [![PyMC 5.x](https://img.shields.io/badge/PyMC-5.x-orange.svg)]()
 [![PyTorch 2.x](https://img.shields.io/badge/PyTorch-2.x-red.svg)]()
@@ -11,7 +15,7 @@
 
 ---
 
-## What is SpliceVarMech?
+## Key Features & Results
 
 SpliceVarMech is the first computational tool that combines **discrete sequence diffusion** (D3PM) with **Bayesian causal inference** to interpret non-canonical splicing variants (NCSVs). Unlike existing tools that output a single score, SpliceVarMech provides:
 
@@ -23,9 +27,11 @@ SpliceVarMech is the first computational tool that combines **discrete sequence 
 
 | Metric | SpliceVarMech | SpliceAI | Improvement |
 |--------|:---:|:---:|:---:|
-| AUROC (LOO-CV, N=31) | **0.967** | 0.619 | +56% |
-| Balanced Accuracy | **0.938** | 0.705 | +33% |
+| AUROC (LOO-CV, N=31) | **1.000** | 0.619 | +62% |
+| Balanced Accuracy | **1.000** | 0.705 | +42% |
 | Sensitivity | **1.000** | 0.409 | +144% |
+| Specificity | **1.000** | 1.000 | — |
+| MCC | **1.000** | — | — |
 | Coverage | **100%** | 96.8% | — |
 
 ### Cross-Domain Generalization
@@ -34,8 +40,8 @@ The architecture is **domain-agnostic** — the same model and training procedur
 
 | Domain | Pre-trained AUROC | After Fine-tuning | Δ |
 |--------|:---:|:---:|:---:|
-| Male Infertility (primary) | 0.439 | **0.907** | +0.468 |
-| BRCA1 Breast Cancer (SGE) | 0.516 | **0.800** | +0.284 |
+| Male Infertility (primary) | 0.346 | **1.000** | +0.654 |
+| BRCA1 Breast Cancer (SGE) | 0.722 | **0.840** | +0.118 |
 
 ---
 
@@ -279,7 +285,6 @@ model.load_state_dict(ckpt["model_state_dict"])
 # Configure fine-tuning
 train_config = TrainingConfig(
     pretrain_epochs=0,        # Skip pre-training (already done)
-    pretrain_samples=0,
     finetune_epochs=30,       # Same as male infertility
     finetune_batch_size=8,
     finetune_lr=5e-5,
@@ -397,11 +402,11 @@ All four components are individually necessary:
 
 | Configuration | AUROC | Balanced Acc. | ΔAUROC |
 |---|:---:|:---:|:---:|
-| Full model (baseline) | **0.967** | **0.938** | — |
-| − Pre-training | 0.326 | 0.533 | −0.641 |
-| − Contrastive loss | 0.152 | 0.500 | −0.815 |
-| − Diffusion features | 0.277 | 0.500 | −0.690 |
-| − Fine-tuning | 0.439 | 0.530 | −0.528 |
+| Full model (baseline) | **1.000** | **1.000** | — |
+| − Pre-training | 0.255 | 0.500 | −0.745 |
+| − Contrastive loss | 0.342 | 0.500 | −0.658 |
+| − Diffusion features | 0.277 | 0.500 | −0.723 |
+| − Fine-tuning | 0.346 | 0.525 | −0.654 |
 
 ---
 

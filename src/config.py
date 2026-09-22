@@ -136,7 +136,6 @@ def get_training_config():
     return TrainingConfig(
         # Pre-training
         pretrain_epochs=pre.get("epochs", 10),
-        pretrain_samples=pre.get("samples", 100_000),
         pretrain_batch_size=pre.get("batch_size", 16),
         pretrain_lr=pre.get("learning_rate", 1e-4),
         # GENCODE

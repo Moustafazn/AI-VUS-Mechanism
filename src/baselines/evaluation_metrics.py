@@ -835,7 +835,7 @@ def document_component_training(verbose: bool = True) -> dict:
     analysis = {
         "pre_training": {
             "what": "Full diffusion model (encoder + decoder + noise schedule + tissue embedding)",
-            "data": "100K GENCODE real splice junctions with GTEx tissue labels",
+            "data": "252K GENCODE v44 splice junctions from GRCh38",
             "status": "All parameters trained from scratch",
         },
         "fine_tuning": {

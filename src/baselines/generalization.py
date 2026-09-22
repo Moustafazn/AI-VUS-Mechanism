@@ -139,7 +139,7 @@ def _build_context(
             pass
 
     raise RuntimeError(
-        f"Cannot build real genomic context for variant "
+        f"Cannot build genomic context for variant "
         f"(gene={gene!r}, hgvs={hgvs!r}, pos={position}). "
         f"hg38 context extraction failed or gene/hgvs not provided."
     )

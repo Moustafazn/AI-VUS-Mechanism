@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 SpliceVarMech — Publication Figure Generator
-Target Journal: Molecular Cell (Cell Press)
+SpliceVarMech — Publication Figure Generator
 
-Molecular Cell Article format:
+Article format:
   - Max 7 display items (figures or tables) in main text
   - Main text <= 7,000 words (incl. figure legends, excl. STAR Methods)
   - 300 DPI, single column (85mm) or double column (178mm)
@@ -45,7 +45,7 @@ try:
 except ImportError:
     pass
 
-# ── Cell Press style ──
+# ── Publication style ──
 plt.rcParams.update({
     "font.family": "sans-serif",
     "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
@@ -127,7 +127,7 @@ def _curved_arrow(ax, x1, y1, x2, y2, c=C["charcoal"], lw=1.5, rad=0.15):
 # ══════════════════════════════════════════════════════════════════════
 
 def figure1_framework():
-    """Clean Cell Press-style pipeline diagram — minimal text, clear flow."""
+    """Clean pipeline diagram — minimal text, clear flow."""
     fig, ax = plt.subplots(figsize=(DC, DC * 0.62))
     ax.set_xlim(0, 16)
     ax.set_ylim(0, 10)
@@ -742,7 +742,7 @@ def figureS3_generalization():
 
 def main():
     print("=" * 60)
-    print("SpliceVarMech Figure Generator — Molecular Cell")
+    print("SpliceVarMech — Figure Generator")
     print("=" * 60)
 
     expected = ["pretrain_history.json", "finetune_history.json", "baseline_tools.json",

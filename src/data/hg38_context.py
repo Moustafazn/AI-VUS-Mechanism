@@ -1,7 +1,7 @@
 """
 SpliceVarMech — Real Genomic Context Extraction from GRCh38
 
-Extracts real pre-mRNA contexts from the human reference genome for:
+Extracts pre-mRNA contexts from the human reference genome for:
   - Gold-standard variant fine-tuning (S7/S2 variants)
   - TEX11 c.1156+16G>T prediction
   - Any variant with known gene + HGVS notation
@@ -81,7 +81,7 @@ class SpliceContext:
     # Metadata
     strand: str = "+"
     transcript_id: str = ""
-    is_real: bool = True   # True if from hg38, False if synthetic fallback
+    is_real: bool = True   # True if from hg38, False if extraction failed
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -225,7 +225,7 @@ def extract_splice_context(
     gtf_path: str = "",
 ) -> Optional[SpliceContext]:
     """
-    Extract real pre-mRNA context from hg38 for a variant.
+    Extract pre-mRNA context from hg38 for a variant.
     
     Args:
         gene: Gene symbol (e.g., "TEX11")
@@ -234,7 +234,7 @@ def extract_splice_context(
         max_intron_len: Maximum intron length to include
     
     Returns:
-        SpliceContext with real sequences, or None if extraction fails
+        SpliceContext with hg38 sequences, or None if extraction fails
     """
     # Parse HGVS to determine variant type and position
     # Intronic: c.1156+16G>T → position +16 after exon boundary
@@ -606,7 +606,7 @@ def extract_splice_context(
 
 def extract_tex11_context() -> SpliceContext:
     """
-    Extract real TEX11 c.1156+16G>T context from hg38.
+    Extract TEX11 c.1156+16G>T context from hg38.
 
     Requires GRCh38 FASTA and GENCODE GTF in data/external/.
     Raises RuntimeError if extraction fails.
@@ -619,7 +619,7 @@ def extract_tex11_context() -> SpliceContext:
             "exist in data/external/."
         )
 
-    print(f"  [hg38] TEX11 real context extracted:")
+    print(f"  [hg38] TEX11 context extracted:")
     print(f"    Chromosome: {ctx.chrom}")
     print(f"    WT pre-mRNA: {len(ctx.wt_pre_mrna)} bp")
     print(f"    Mutant pre-mRNA: {len(ctx.mut_pre_mrna)} bp")
@@ -634,17 +634,16 @@ def extract_gold_standard_contexts(
     verbose: bool = True,
 ) -> list[SpliceContext]:
     """
-    Extract real hg38 contexts for all gold-standard variants (S7 + S2).
+    Extract hg38 contexts for all gold-standard variants (S7 + S2).
     
-    Returns list of SpliceContext objects with real genomic sequences.
-    Variants that can't be mapped fall back to synthetic contexts.
+    Returns list of SpliceContext objects with genomic sequences.
+    Variants that can't be mapped are skipped.
     """
     from src.data.parser import parse_dataset
     
     dataset = parse_dataset()
     contexts = []
     n_real = 0
-    n_synthetic = 0
     
     # S7 positives
     n_failed = []
@@ -674,9 +673,9 @@ def extract_gold_standard_contexts(
             n_failed.append(f"{gene}:{hgvs}")
     
     if verbose:
-        print(f"  [hg38] Gold-standard contexts: {n_real} real, {len(n_failed)} failed")
+        print(f"  [hg38] Gold-standard contexts: {n_real} extracted, {len(n_failed)} failed")
         if n_failed:
-            print(f"  [hg38] Failed variants (skipped — no synthetic fallback):")
+            print(f"  [hg38] Failed variants (skipped):")
             for name in n_failed[:10]:
                 print(f"    ✗ {name}")
             if len(n_failed) > 10:

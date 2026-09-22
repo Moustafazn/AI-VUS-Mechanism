@@ -9,7 +9,7 @@ Usage:
     python main.py --phase 2        # Splice tool analysis
     python main.py --phase 3        # Bayesian causal model diagnostics
     python main.py --phase 4        # Training pipeline
-    python main.py --phase 5        # TEX11 prediction + clinical report
+    python main.py --phase 5        # Case study prediction (requires predict.py)
     python main.py --baselines      # Run baseline tool evaluation
     python main.py --spliceai       # SpliceAI head-to-head evaluation
     python main.py --loo            # Leave-one-out cross-validation
@@ -198,7 +198,7 @@ def phase4_training():
           f"schedule={diff_config.noise_schedule}")
     print(f"  Contrastive: weight={diff_config.contrastive_weight}, "
           f"margin={diff_config.contrastive_margin}")
-    print(f"  Pre-training: {train_config.pretrain_samples:,} paired (WT, MUT) splice junctions")
+    print(f"  Pre-training: GENCODE junctions (max {train_config.gencode_max_examples:,})")
     print(f"  Pre-train epochs: {train_config.pretrain_epochs}")
     print(f"  Fine-tune epochs: {train_config.finetune_epochs}")
 
@@ -372,7 +372,7 @@ def run_loo_cv():
 
 
 def run_ablation(ablation_id=None):
-    """Run ablation studies — actual execution with real data."""
+    """Run ablation studies — actual execution with gold-standard data."""
     import re
     from src.data.parser import parse_dataset
     from src.features.splice_scores import match_gold_standard_to_s1
@@ -424,16 +424,29 @@ def run_xai():
     import numpy as np
     from src.config import get_diffusion_config
     from src.diffusion.model import BiologicalDiffusionModel
-    from src.diffusion.training import _exon_with_ese, _intron_with_consensus
     from src.xai.attribution import run_xai_analysis, format_attribution_heatmap
+    from src.data.hg38_context import extract_splice_context
 
     config = get_diffusion_config()
     model = BiologicalDiffusionModel(config)
 
-    exon = _exon_with_ese(60)
-    intron = _intron_with_consensus(60)
-    context = (exon + intron + _exon_with_ese(60))[:128]
-    target = (exon + _exon_with_ese(60))[:128]
+    # Use first available gold-standard variant for attribution analysis
+    from src.data.parser import parse_dataset as _parse_xai
+    _ds = _parse_xai()
+    _xai_ctx = None
+    for _v in _ds.gold_standard_positives:
+        _gene = _v.gene_variant.split(":")[0] if ":" in _v.gene_variant else ""
+        _hgvs = _v.hgvs.strip() if hasattr(_v, 'hgvs') else ""
+        if _gene and _hgvs:
+            _xai_ctx = extract_splice_context(_gene, _hgvs)
+            if _xai_ctx:
+                print(f"  XAI variant: {_v.gene_variant}")
+                break
+    if _xai_ctx is None:
+        print("  ⚠️  No hg38 context available for XAI — skipping")
+        return None
+    context = _xai_ctx.wt_pre_mrna[:128]
+    target = _xai_ctx.wt_mrna[:128]
 
     # ── Compute Bayesian coefficients from Phase 3 causal model ──
     bayesian_coefficients = None
@@ -928,7 +941,7 @@ def print_project_summary():
     python main.py --phase 2    # Feature analysis
     python main.py --phase 3    # Bayesian diagnostics
     python main.py --phase 4    # Training
-    python main.py --phase 5    # TEX11 prediction
+    python main.py --phase 5    # Case study prediction
     python main.py --baselines  # Baseline evaluation
     python main.py --spliceai   # SpliceAI head-to-head
     python main.py --loo        # LOO cross-validation
@@ -947,7 +960,7 @@ def print_project_summary():
         ("src.causal.loo_cv", "Phase 3: LOO Cross-Validation"),
         ("src.diffusion.training", "Phase 4: Training Pipeline"),
         ("src.diffusion.sampling", "Phase 4: Sampling/Inference"),
-        ("src.pipeline.predict", "Phase 5: TEX11 Prediction"),
+        ("src.pipeline.predict", "Phase 5: Case Study Prediction"),
         ("src.baselines.tool_evaluation", "Baselines: Tool Evaluation"),
         ("src.baselines.spliceai_evaluation", "Baselines: SpliceAI Eval"),
         ("src.baselines.ablation", "Baselines: Ablation Studies"),
@@ -1001,7 +1014,6 @@ if __name__ == "__main__":
         phase2_features()
         phase3_causal()
         phase4_training()
-        phase5_prediction()
         run_xai()
         run_baselines()
         run_spliceai_eval()

@@ -476,9 +476,9 @@ def analyze_causal_paths(
 
 def visualize_mechanism(
     mechanism: str,
-    gene: str = "TEX11",
+    gene: str = "",
     exon_number: int = 0,
-    variant_position: int = 16,
+    variant_position: int = 0,
 ) -> MechanismVisualization:
     """
     Create a visual representation of the predicted splice mechanism.
@@ -600,9 +600,9 @@ def run_xai_analysis(
     model: BiologicalDiffusionModel,
     context_seq: str,
     target_seq: str,
-    variant: str = "c.1156+16G>T",
-    gene: str = "TEX11",
-    variant_position: int = 16,
+    variant: str = "",
+    gene: str = "",
+    variant_position: int = 0,
     variant_type: str = "intronic",
     mechanism: str = "exon_skipping",
     posterior_p: float = 0.75,

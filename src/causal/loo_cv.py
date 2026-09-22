@@ -146,8 +146,11 @@ def run_loo_cv(
         X_test_raw, _ = build_feature_matrix([test_feature])
         X_test_std = X_test_raw.copy()
 
-        # Standardize using training set statistics
-        binary_features = {"is_exonic", "SpliceAI_missing", "MMSplice_missing"}
+        # Standardize using training set statistics (must match dag.py)
+        binary_features = {
+            "is_exonic", "is_mechanism_exon_skipping", "is_mechanism_intron_retention",
+            "is_missense", "is_intronic",
+        }
         for j_feat, name in enumerate(obs_data["feature_names"]):
             if name not in binary_features:
                 X_test_std[0, j_feat] = (
@@ -170,6 +173,28 @@ def run_loo_cv(
 
             # Compute logit for each posterior sample
             logit_p = intercept_flat + betas_flat @ X_test_std.flatten()
+
+            # Add beta_diffusion term if present in the posterior
+            if "beta_diffusion" in trace.posterior.data_vars:
+                beta_diff_samples = trace.posterior["beta_diffusion"].values.flatten()
+                diff_score = (
+                    test_feature.diffusion_aberrant_fraction
+                    if test_feature.diffusion_aberrant_fraction is not None else 0.0
+                )
+                # Standardize using training set diffusion statistics
+                train_diff = np.array([
+                    f.diffusion_aberrant_fraction
+                    if f.diffusion_aberrant_fraction is not None else 0.0
+                    for f in train_features
+                ])
+                diff_mean = train_diff.mean()
+                diff_std = train_diff.std()
+                if diff_std > 1e-10:
+                    diff_standardized = (diff_score - diff_mean) / diff_std
+                else:
+                    diff_standardized = diff_score - diff_mean
+                logit_p = logit_p + beta_diff_samples * diff_standardized
+
             p_samples = 1.0 / (1.0 + np.exp(-logit_p))
 
             loo_p_mean[i] = float(p_samples.mean())

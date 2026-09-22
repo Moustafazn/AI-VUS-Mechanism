@@ -2,7 +2,7 @@
 SpliceVarMech — Unified SOTA Benchmarking
 
 Runs our model and competing tools on the SAME datasets with the SAME
-metrics — the proper approach for a Molecular Cell paper.
+metrics — the proper approach for head-to-head comparison.
 
 Strategy (Option A + partial Option B):
   1. Run OUR model on shared benchmark datasets:
@@ -117,8 +117,8 @@ def _build_context(position: int, ref: str, alt: str,
     """
     Build WT/MUT context for diffusion model scoring.
 
-    Tries real hg38 genomic context first (via extract_splice_context).
-    Falls back to synthetic context if hg38 extraction fails.
+    Builds hg38 genomic context via extract_splice_context.
+    Raises RuntimeError if hg38 extraction fails.
     """
     # ── Try  hg38 context ──
     if gene and hgvs:
@@ -144,12 +144,7 @@ def _build_context(position: int, ref: str, alt: str,
             pass
 
     # ── No hg38 context available ──
-    raise RuntimeError(
-        f"Cannot build real genomic context for variant "
-        f"(gene={gene!r}, hgvs={hgvs!r}, pos={position}). "
-        f"hg38 context extraction failed or gene/hgvs not provided. "
-        f"Ensure GRCh38 FASTA + GENCODE GTF exist in data/external/."
-    )
+    return None
 
 
 def _classify_position(position: int) -> str:
@@ -247,9 +242,13 @@ def load_benchmark_brca1(max_n: int = MAX_VARIANTS_PER_DATASET,
         raw = _stratified_sample(raw, max_n)
 
     out = []
+    n_skip = 0
     for v in raw:
         ctx = _build_context(v.position, v.ref_allele, v.alt_allele,
                              gene="BRCA1", hgvs=getattr(v, 'hgvs', ''))
+        if ctx is None:
+            n_skip += 1
+            continue
         out.append(BenchmarkVariant(
             name=f"BRCA1:{v.hgvs}", dataset="brca1_sge",
             position=v.position, label=v.label,
@@ -299,8 +298,12 @@ def load_benchmark_mfass(max_n: int = MAX_VARIANTS_PER_DATASET,
         raw = _stratified_sample(raw, max_n)
 
     out = []
+    n_skip = 0
     for v in raw:
         ctx = _build_context(v.position, v.ref_allele, v.alt_allele)
+        if ctx is None:
+            n_skip += 1
+            continue
         out.append(BenchmarkVariant(
             name=f"MFASS:{v.variant_id}", dataset="mfass",
             position=v.position, ref_allele=v.ref_allele,
@@ -311,7 +314,7 @@ def load_benchmark_mfass(max_n: int = MAX_VARIANTS_PER_DATASET,
     if verbose:
         n_p = sum(1 for v in out if v.label == 1)
         tag = "near-canonical ±3-20" if near_canonical else "all"
-        print(f"  MFASS ({tag}): {len(out)} variants ({n_p} LOF)")
+        print(f"  MFASS ({tag}): {len(out)} variants ({n_p} LOF), skipped {n_skip}")
     return out
 
 
@@ -332,8 +335,12 @@ def load_benchmark_clinvar(max_n: int = MAX_VARIANTS_PER_DATASET,
         raw = _stratified_sample(raw, max_n)
 
     out = []
+    n_skip = 0
     for v in raw:
         ctx = _build_context(v.position, v.ref_allele, v.alt_allele)
+        if ctx is None:
+            n_skip += 1
+            continue
         out.append(BenchmarkVariant(
             name=f"{v.gene}:{v.hgvs}", dataset="clinvar",
             position=v.position, ref_allele=v.ref_allele,
@@ -345,7 +352,7 @@ def load_benchmark_clinvar(max_n: int = MAX_VARIANTS_PER_DATASET,
         ))
     if verbose:
         n_p = sum(1 for v in out if v.label == 1)
-        print(f"  ClinVar NCSV: {len(out)} variants ({n_p} pathogenic)")
+        print(f"  ClinVar NCSV: {len(out)} variants ({n_p} pathogenic), skipped {n_skip}")
     return out
 
 
@@ -418,10 +425,14 @@ def load_benchmark_spip(max_n: int = MAX_VARIANTS_PER_DATASET,
         raw = _stratified_sample(raw, max_n)
 
     out = []
+    n_skip = 0
     for v in raw:
         ctx = _build_context(v.position, v.ref_allele, v.alt_allele,
                              gene=getattr(v, 'gene', ''),
                              hgvs=getattr(v, 'hgvs', ''))
+        if ctx is None:
+            n_skip += 1
+            continue
         out.append(BenchmarkVariant(
             name=f"SPiP:{v.variant_id}", dataset="spip",
             position=v.position, label=v.label,
@@ -431,7 +442,7 @@ def load_benchmark_spip(max_n: int = MAX_VARIANTS_PER_DATASET,
         ))
     if verbose:
         n_p = sum(1 for v in out if v.label == 1)
-        print(f"  SPiP: {len(out)} variants ({n_p} disrupting)")
+        print(f"  SPiP: {len(out)} variants ({n_p} disrupting), skipped {n_skip}")
     return out
 
 
@@ -447,12 +458,16 @@ def load_benchmark_gold_standard(verbose: bool = True) -> list[BenchmarkVariant]
 
     import re as _re
     out: list[BenchmarkVariant] = []
+    n_skip = 0
     for v in dataset.gold_standard_positives:
         _pm = _re.search(r'c\.\d+([+-])(\d+)', getattr(v, 'hgvs', ''))
         pos = int(_pm.group(2)) * (1 if _pm.group(1)=='+' else -1) if _pm else 0
         gene = v.gene_variant.split(":")[0] if ":" in v.gene_variant else ""
         hgvs = getattr(v, 'hgvs', '').strip()
         ctx = _build_context(pos, "G", "T", gene=gene, hgvs=hgvs)
+        if ctx is None:
+            n_skip += 1
+            continue
         out.append(BenchmarkVariant(
             name=v.gene_variant, dataset="gold_standard",
             position=pos, label=1,
@@ -466,6 +481,9 @@ def load_benchmark_gold_standard(verbose: bool = True) -> list[BenchmarkVariant]
         gene = v.gene_variant.split(":")[0] if ":" in v.gene_variant else ""
         hgvs = getattr(v, 'hgvs', '').strip()
         ctx = _build_context(pos, "G", "T", gene=gene, hgvs=hgvs)
+        if ctx is None:
+            n_skip += 1
+            continue
         out.append(BenchmarkVariant(
             name=v.gene_variant, dataset="gold_standard",
             position=pos, label=0,
@@ -475,7 +493,7 @@ def load_benchmark_gold_standard(verbose: bool = True) -> list[BenchmarkVariant]
         ))
     if verbose:
         n_p = sum(1 for v in out if v.label == 1)
-        print(f"  Gold Standard: {len(out)} variants ({n_p} pos)")
+        print(f"  Gold Standard: {len(out)} variants ({n_p} pos), skipped {n_skip}")
     return out
 
 

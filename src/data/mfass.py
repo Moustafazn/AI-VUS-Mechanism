@@ -68,12 +68,12 @@ def load_mfass_variants(
     verbose: bool = True,
 ) -> list[MFASSVariant]:
     """
-    Load MFASS variants from the real KosuriLab/MFASS processed data.
+    Load MFASS variants from the KosuriLab/MFASS processed data.
     
     Data source: https://github.com/KosuriLab/MFASS
     File: processed_data/snv/snv_data_clean.txt
     
-    Key columns from the real data:
+    Key columns from the data:
         - id: variant identifier (e.g., ENSE00000332835_007)
         - ensembl_id: exon Ensembl ID
         - ref_allele, alt_allele: nucleotide change
@@ -112,7 +112,7 @@ def _parse_real_mfass(
     verbose: bool,
 ) -> list[MFASSVariant]:
     """
-    Parse the real MFASS snv_data_clean.txt from KosuriLab GitHub.
+    Parse the MFASS snv_data_clean.txt from KosuriLab GitHub.
     
     Columns used:
         id (0), ensembl_id (1), ref_allele (10), alt_allele (11),
@@ -302,7 +302,7 @@ def compute_mfass_diffusion_scores(
 ) -> list[float]:
     """
     Compute diffusion disruption scores for MFASS variants using their
-    real experimental sequences from the minigene constructs.
+    experimental sequences from the minigene constructs.
     
     Each MFASS variant has:
     - original_seq: WT minigene construct (~170bp: intron1 + exon + intron2)

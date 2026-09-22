@@ -395,7 +395,7 @@ class SpliceSampler:
         Counterfactual comparison: generate from WT context vs MUT context.
 
         WT context uses WT for both streams → no variant effect (baseline).
-        MUT context uses real WT vs MUT → variant effect visible.
+        MUT context uses WT vs MUT → variant effect visible.
         """
         print("  Generating wild-type baseline samples...")
         wt_dist = self.analyze_outcomes(

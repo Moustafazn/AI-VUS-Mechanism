@@ -4,7 +4,8 @@ SpliceVarMech — Biological Diffusion Model Training Pipeline
 Two-stage training for the BiologicalDiffusionModel:
 
   Stage 1 — Pre-training on GENCODE splice junctions WITH simulated variants
-    • Requires real GENCODE GTF + FASTA (no fallback)
+    • Requires GENCODE GTF + GRCh38 FASTA (no fallback)
+    • Extracts exon-intron-exon triplets from GENCODE v44
     • For EACH junction, creates a paired (WT, MUT) example:
       - Mutate a position near the splice site → MUT context
       - If mutation destroys GT/AG → disruptive (target = aberrant mRNA)
@@ -24,6 +25,8 @@ from __future__ import annotations
 
 import random
 import math
+import re as _re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -46,47 +49,21 @@ from src.config import get_resource_config, clear_memory_cache
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Biologically informed sequence generation
+# Sequence utilities
 # ──────────────────────────────────────────────────────────────────────
-
-# Load splice motifs from config.yaml
-from src.config import get_splice_motifs as _get_motifs
-_motifs = _get_motifs()
-ESE_HEXAMERS = _motifs["ese_hexamers"]
-DONOR_CONSENSUS = _motifs["donor_consensus"]
-ACCEPTOR_CONSENSUS = _motifs["acceptor_consensus"]
-PYRIMIDINE_TRACT = _motifs["polypyrimidine_tract"]
-
-
-def _random_seq(length: int) -> str:
-    return "".join(random.choice("ACGT") for _ in range(length))
-
-
-def _exon_with_ese(length: int = 100) -> str:
-    seq = list(_random_seq(length))
-    for _ in range(random.randint(1, 2)):
-        ese = random.choice(ESE_HEXAMERS)
-        pos = random.randint(5, length - len(ese) - 5)
-        for i, c in enumerate(ese):
-            seq[pos + i] = c
-    return "".join(seq)
-
-
-def _intron_with_consensus(length: int = 200) -> str:
-    bp = "TACTAAC"
-    fixed_len = len(DONOR_CONSENSUS) + len(bp) + len(PYRIMIDINE_TRACT) + len(ACCEPTOR_CONSENSUS)
-    min_length = fixed_len + 5
-    if length < min_length:
-        length = min_length
-    body_len = length - fixed_len
-    body = _random_seq(body_len)
-    intron = DONOR_CONSENSUS + body + bp + PYRIMIDINE_TRACT + ACCEPTOR_CONSENSUS
-    return intron
 
 
 def _reverse_complement(seq: str) -> str:
     comp = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
     return "".join(comp.get(c, "N") for c in reversed(seq))
+
+
+# Load splice motifs from config.yaml for pretraining label assignment
+from src.config import get_splice_motifs as _get_motifs
+_motifs = _get_motifs()
+_ESE_SET = set(_motifs["ese_hexamers"])
+_ESS_SET = set(_motifs["ess_hexamers"])
+_BRANCH_POINT = _motifs["branch_point"]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -112,57 +89,35 @@ def _nucleotide_to_token(nuc: str) -> int:
     return VOCAB.get(nuc.upper(), VOCAB["A"])
 
 
-def generate_paired_junction(
-    exon1_len: int = 100,
-    intron_len: int = 200,
-    exon2_len: int = 100,
+def _mutate_junction(
+    exon1: str,
+    intron: str,
+    exon2: str,
 ) -> PairedSpliceExample:
     """
-    Generate a paired (WT, MUT) splice junction example.
-
-    Strategy: create a normal junction, then mutate ONE position.
-    If the mutation hits a critical splice signal → disruptive.
-    If it hits an unimportant position → benign.
+    Given a GENCODE exon-intron-exon triplet, introduce a single-nucleotide
+    mutation and determine whether it disrupts splicing.
 
     This teaches the model which mutations matter.
     """
-    exon1 = _exon_with_ese(exon1_len)
-    intron = _intron_with_consensus(intron_len)
-    exon2 = _exon_with_ese(exon2_len)
-
     wt_pre_mrna = exon1 + intron + exon2
     normal_mrna = exon1 + exon2  # Correct splicing
 
+    exon1_len = len(exon1)
     # Choose a mutation position (biased toward splice-relevant positions)
     intron_start = exon1_len
     intron_end = exon1_len + len(intron)
 
-    # 50% chance: mutate near splice site (positions 0-5 of intron = donor)
-    # 30% chance: mutate in intron body (harmless)
-    # 20% chance: mutate near acceptor (last 5bp of intron)
-    r = random.random()
-    if r < 0.5:
-        # Donor region (first 6bp of intron)
-        offset = random.randint(0, min(5, len(intron) - 1))
-        mut_pos_in_seq = intron_start + offset
-    elif r < 0.8:
-        # Intron body (harmless)
-        body_start = intron_start + 6
-        body_end = intron_end - 6
-        if body_end > body_start:
-            mut_pos_in_seq = random.randint(body_start, body_end - 1)
-        else:
-            mut_pos_in_seq = intron_start + len(intron) // 2
-    else:
-        # Acceptor region (last 6bp of intron)
-        offset = random.randint(0, min(5, len(intron) - 1))
-        mut_pos_in_seq = intron_end - 1 - offset
+    # Uniform mutation across the entire exon-intron-exon sequence
+    mut_pos_in_seq = random.randint(0, len(wt_pre_mrna) - 1)
 
     # Clamp to valid range
     mut_pos_in_seq = max(0, min(mut_pos_in_seq, len(wt_pre_mrna) - 1))
 
     # Get ref and choose alt
     ref = wt_pre_mrna[mut_pos_in_seq]
+    if ref not in "ACGT":
+        ref = "A"
     alternatives = [n for n in "ACGT" if n != ref]
     alt = random.choice(alternatives)
 
@@ -172,39 +127,95 @@ def generate_paired_junction(
     mut_pre_mrna = "".join(mut_list)
 
     # Determine if mutation is disruptive
-    # Check if it destroys GT donor or AG acceptor
+    # Check all spliceosome recognition elements
     pos_in_intron = mut_pos_in_seq - intron_start
     is_disruptive = False
     mechanism = "normal"
     target = normal_mrna
+    retention_target = exon1 + "".join(mut_list[intron_start:intron_end]) + exon2
 
     if 0 <= pos_in_intron < len(intron):
         # Donor site: positions 0-1 (GT)
         if pos_in_intron <= 1:
             is_disruptive = True
             mechanism = "intron_retention"
-            target = exon1 + "".join(mut_list[intron_start:intron_end]) + exon2
+            target = retention_target
         # Strong donor: positions 2-5
         elif pos_in_intron <= 5:
-            if random.random() < 0.7:  # 70% chance of disruption
+            if random.random() < 0.7:
                 is_disruptive = True
                 mechanism = random.choice(["exon_skipping", "intron_retention"])
-                if mechanism == "exon_skipping":
-                    target = exon1
-                else:
-                    target = exon1 + "".join(mut_list[intron_start:intron_end]) + exon2
+                target = exon1 if mechanism == "exon_skipping" else retention_target
         # Acceptor site: last 2 positions (AG)
         elif pos_in_intron >= len(intron) - 2:
             is_disruptive = True
             mechanism = "intron_retention"
-            target = exon1 + "".join(mut_list[intron_start:intron_end]) + exon2
-        # Near acceptor: last 3-6 positions (PPT region)
-        elif pos_in_intron >= len(intron) - 6:
+            target = retention_target
+        # Branch point region (intron -15 to -40, SF1/U2 binding)
+        # Checked before PPT because branch point A is essential for lariat
+        elif len(intron) - 40 <= pos_in_intron <= len(intron) - 15:
+            bp_win = intron[max(0, pos_in_intron - 3):pos_in_intron + 4]
+            if "CTAAT" in bp_win or "CTAAC" in bp_win or "CTGAC" in bp_win \
+                    or "TTAAT" in bp_win or _BRANCH_POINT[:4] in bp_win:
+                is_disruptive = True
+                mechanism = "intron_retention"
+                target = retention_target
+            elif intron[pos_in_intron] in "CT" and alt in "AG":
+                is_disruptive = True
+                mechanism = "intron_retention"
+                target = retention_target
+        # PPT / U2AF65 binding region (intron -3 to -15)
+        elif pos_in_intron >= len(intron) - 15:
+            if intron[pos_in_intron] in "CT" and alt in "AG":
+                is_disruptive = True
+                mechanism = "intron_retention"
+                target = retention_target
+    elif mut_pos_in_seq < intron_start:
+        # Exon-side donor (last 3bp of exon1 — U1 snRNP binding)
+        if mut_pos_in_seq >= intron_start - 3:
             if random.random() < 0.5:
                 is_disruptive = True
-                mechanism = "partial_deletion"
-                cut = random.randint(10, max(11, exon2_len - 10))
-                target = exon1 + exon2[cut:]
+                mechanism = "exon_skipping"
+                target = exon1
+        # ESE disruption / ESS creation in exon1
+        elif exon1_len > 6:
+            for off in range(max(0, mut_pos_in_seq - 5), min(mut_pos_in_seq + 1, exon1_len - 5)):
+                wt_hex = exon1[off:off + 6]
+                mt_hex = mut_pre_mrna[off:off + 6]
+                if wt_hex in _ESE_SET and mt_hex not in _ESE_SET:
+                    is_disruptive = True
+                    mechanism = "exon_skipping"
+                    target = exon1
+                    break
+                if wt_hex not in _ESS_SET and mt_hex in _ESS_SET:
+                    is_disruptive = True
+                    mechanism = "exon_skipping"
+                    target = exon1
+                    break
+    else:
+        pos_in_exon2 = mut_pos_in_seq - intron_end
+        # Exon-side acceptor (first 3bp of exon2)
+        if pos_in_exon2 < 3:
+            if random.random() < 0.5:
+                is_disruptive = True
+                mechanism = "exon_skipping"
+                target = exon1
+        # ESE disruption / ESS creation in exon2
+        elif len(exon2) > 6:
+            e2_off = intron_end
+            for off in range(max(0, pos_in_exon2 - 5), min(pos_in_exon2 + 1, len(exon2) - 5)):
+                wt_hex = exon2[off:off + 6]
+                mt_hex = mut_pre_mrna[e2_off + off:e2_off + off + 6]
+                if wt_hex in _ESE_SET and mt_hex not in _ESE_SET:
+                    is_disruptive = True
+                    mechanism = "exon_skipping"
+                    target = exon1
+                    break
+                if wt_hex not in _ESS_SET and mt_hex in _ESS_SET:
+                    is_disruptive = True
+                    mechanism = "exon_skipping"
+                    target = exon1
+                    break
 
     return PairedSpliceExample(
         wt_pre_mrna=wt_pre_mrna,
@@ -219,26 +230,151 @@ def generate_paired_junction(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# GENCODE junction extraction
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _extract_gencode_junctions(
+    gtf_path: str,
+    fasta_path: str,
+    max_examples: int = 252_835,
+    max_intron_len: int = 5000,
+    min_exon_len: int = 20,
+    max_exon_len: int = 150,
+    verbose: bool = True,
+) -> list[tuple[str, str, str]]:
+    """
+    Extract exon-intron-exon triplets from GENCODE GTF + GRCh38 FASTA.
+
+    Returns list of (exon1_seq, intron_seq, exon2_seq) tuples.
+    """
+    from src.data.hg38_context import _get_fasta, _fetch_sequence
+
+    if verbose:
+        print(f"  [GENCODE] Parsing GTF: {gtf_path}")
+
+    # Parse GTF: collect exons per protein-coding transcript
+    transcripts: dict[str, list[tuple[str, int, int, str]]] = defaultdict(list)
+    n_lines = 0
+    with open(gtf_path) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 9 or cols[2] != "exon":
+                continue
+            attrs = cols[8]
+
+            if 'transcript_type "protein_coding"' not in attrs:
+                continue
+
+            tid_m = _re.search(r'transcript_id "([^"]+)"', attrs)
+            if not tid_m:
+                continue
+            tid = tid_m.group(1)
+
+            chrom = cols[0]
+            start = int(cols[3]) - 1  # GTF 1-based → 0-based
+            end = int(cols[4])
+            strand = cols[6]
+            transcripts[tid].append((chrom, start, end, strand))
+            n_lines += 1
+
+    if verbose:
+        print(f"  [GENCODE] Parsed {n_lines} exon lines from "
+              f"{len(transcripts)} protein-coding transcripts")
+
+    _get_fasta(fasta_path)
+
+    junctions: list[tuple[str, str, str]] = []
+
+    for tid, exons_raw in transcripts.items():
+        if len(exons_raw) < 2:
+            continue
+
+        chrom = exons_raw[0][0]
+        strand = exons_raw[0][3]
+        sorted_exons = sorted(exons_raw, key=lambda e: e[1])
+
+        for i in range(len(sorted_exons) - 1):
+            _, e1_start, e1_end, _ = sorted_exons[i]
+            _, e2_start, e2_end, _ = sorted_exons[i + 1]
+
+            e1_len = e1_end - e1_start
+            e2_len = e2_end - e2_start
+            intron_len = e2_start - e1_end
+
+            if intron_len <= 0 or intron_len > max_intron_len:
+                continue
+            if e1_len < min_exon_len or e2_len < min_exon_len:
+                continue
+
+            # Trim exons to max_exon_len (keep the splice-site end)
+            if e1_len > max_exon_len:
+                e1_start = e1_end - max_exon_len
+            if e2_len > max_exon_len:
+                e2_end = e2_start + max_exon_len
+
+            try:
+                exon1_seq = _fetch_sequence(chrom, e1_start, e1_end, fasta_path)
+                intron_seq = _fetch_sequence(chrom, e1_end, e2_start, fasta_path)
+                exon2_seq = _fetch_sequence(chrom, e2_start, e2_end, fasta_path)
+            except Exception:
+                continue
+
+            total = exon1_seq + intron_seq + exon2_seq
+            if total.count("N") > len(total) * 0.05:
+                continue
+
+            if strand == "-":
+                exon1_seq = _reverse_complement(exon1_seq)
+                intron_seq = _reverse_complement(intron_seq)
+                exon2_seq = _reverse_complement(exon2_seq)
+                exon1_seq, exon2_seq = exon2_seq, exon1_seq
+
+            # Verify canonical GT-AG splice signals
+            if len(intron_seq) >= 4:
+                donor = intron_seq[:2]
+                acceptor = intron_seq[-2:]
+                if donor != "GT" or acceptor != "AG":
+                    continue
+
+            junctions.append((exon1_seq, intron_seq, exon2_seq))
+
+            if len(junctions) >= max_examples:
+                break
+
+        if len(junctions) >= max_examples:
+            break
+
+    if verbose:
+        print(f"  [GENCODE] Extracted {len(junctions):,} canonical GT-AG "
+              f"exon-intron-exon junctions")
+
+    return junctions
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Datasets
 # ──────────────────────────────────────────────────────────────────────
 
 class PairedSpliceDataset(Dataset):
     """
-    Pre-training dataset: paired (WT, MUT) splice junctions.
+    Pre-training dataset: paired (WT, MUT) splice junctions from GENCODE.
 
-    Each example teaches the model:
-    - WT context → normal mRNA (baseline splicing)
-    - MUT context → normal or aberrant mRNA (depending on mutation)
-    - Which mutations disrupt splicing and which are benign
+    Extracts exon-intron-exon triplets from GENCODE v44 + GRCh38 FASTA,
+    then introduces a single-nucleotide mutation in each junction.
     """
 
     def __init__(
         self,
-        n_samples: int = 10000,
+        gtf_path: str,
+        fasta_path: str,
+        max_examples: int = 252_835,
+        max_intron_len: int = 5000,
+        min_exon_len: int = 20,
         ctx_len: int = 400,
         target_len: int = 200,
-        exon_range: tuple[int, int] = (60, 120),
-        intron_range: tuple[int, int] = (80, 300),
         seed: int = 42,
     ):
         super().__init__()
@@ -247,17 +383,30 @@ class PairedSpliceDataset(Dataset):
         random.seed(seed)
         np.random.seed(seed)
 
+        junctions = _extract_gencode_junctions(
+            gtf_path=gtf_path,
+            fasta_path=fasta_path,
+            max_examples=max_examples,
+            max_intron_len=max_intron_len,
+            min_exon_len=min_exon_len,
+        )
+
+        if len(junctions) == 0:
+            raise RuntimeError(
+                "No GENCODE junctions could be extracted. "
+                "Ensure GENCODE GTF and GRCh38 FASTA exist at:\n"
+                f"  GTF:   {gtf_path}\n"
+                f"  FASTA: {fasta_path}"
+            )
+
         self.examples: list[PairedSpliceExample] = []
-        for _ in range(n_samples):
-            e1 = random.randint(*exon_range)
-            il = random.randint(*intron_range)
-            e2 = random.randint(*exon_range)
-            ex = generate_paired_junction(e1, il, e2)
+        for exon1, intron, exon2 in junctions:
+            ex = _mutate_junction(exon1, intron, exon2)
             self.examples.append(ex)
 
         n_dis = sum(1 for e in self.examples if e.label == 1)
-        print(f"  [PairedSplice] Generated {len(self.examples)} examples "
-              f"({n_dis} disruptive, {len(self.examples) - n_dis} benign)")
+        print(f"  [PairedSplice] {len(self.examples):,} GENCODE junction examples "
+              f"({n_dis:,} disruptive, {len(self.examples) - n_dis:,} benign)")
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -278,14 +427,12 @@ class PairedSpliceDataset(Dataset):
 
 class GoldStandardPairedDataset(Dataset):
     """
-    Fine-tuning dataset: real gold-standard variants with WT/MUT pairs.
+    Fine-tuning dataset: gold-standard variants with WT/MUT pairs.
 
-    Uses hg38 reference genome to extract REAL pre-mRNA contexts.
-    Falls back to synthetic contexts when hg38 is unavailable.
+    Uses hg38 reference genome to extract pre-mRNA contexts.
 
     Includes data augmentation:
     - Random nucleotide substitutions in contexts (input noise)
-    - Synthetic paired examples for balance
     """
 
     def __init__(
@@ -315,7 +462,7 @@ class GoldStandardPairedDataset(Dataset):
 
         dataset = parse_dataset()
 
-        # Try hg38 extraction
+        # Extract hg38 contexts
         real_contexts = {}
         try:
             from src.data.hg38_context import extract_splice_context
@@ -326,7 +473,7 @@ class GoldStandardPairedDataset(Dataset):
                     ctx = extract_splice_context(gene, hgvs)
                     if ctx:
                         real_contexts[v.gene_variant] = ctx
-            print(f"  [GoldStandard] Extracted {len(real_contexts)} real hg38 contexts")
+            print(f"  [GoldStandard] Extracted {len(real_contexts)} hg38 contexts")
         except Exception as e:
             print(f"  [GoldStandard] hg38 extraction: {e}")
 
@@ -380,15 +527,15 @@ class GoldStandardPairedDataset(Dataset):
 
         if len(self.examples) == 0:
             raise RuntimeError(
-                "No gold-standard variants could be loaded with real hg38 contexts. "
+                "No gold-standard variants could be loaded with hg38 contexts. "
                 "Ensure GRCh38.primary_assembly.genome.fa and gencode.v44.annotation.gtf "
                 "exist in data/external/."
             )
 
-        # MFASS experimentally validated variants (real labels, require hg38 contexts)
+        # MFASS experimentally validated variants (require hg38 contexts)
         self._load_mfass_variants()
 
-        # gnomAD benign negatives (real labels, require hg38 contexts)
+        # gnomAD benign negatives (require hg38 contexts)
         self._load_gnomad_negatives()
 
         print(f"  [GoldStandard] Loaded {len(self.examples)} primary examples")
@@ -422,8 +569,8 @@ class GoldStandardPairedDataset(Dataset):
         Load MFASS experimentally validated splice variants using their
         built-in minigene sequences (wt_sequence, mut_sequence, wt_mrna).
 
-        MFASS provides 28,972 variants with real experimental splice outcomes
-        AND real minigene construct sequences — no hg38 extraction needed.
+        MFASS provides 28,972 variants with experimental splice outcomes
+        AND minigene construct sequences — no hg38 extraction needed.
 
         Uses a FIXED training subset (seed=42) to ensure reproducibility
         and prevent overlap with the evaluation subset.
@@ -511,7 +658,7 @@ class GoldStandardPairedDataset(Dataset):
 
     def _load_gnomad_negatives(self):
         """
-        Load gnomAD common variants as benign negatives with real hg38 contexts.
+        Load gnomAD common variants as benign negatives with hg38 contexts.
         """
         try:
             from src.data.gnomad import load_gnomad_benign_negatives
@@ -560,7 +707,7 @@ class GoldStandardPairedDataset(Dataset):
             print(f"  [GoldStandard] gnomAD not available: {e}")
 
     def _augment(self, n_per_variant: int):
-        """Data augmentation via input noise on real examples only."""
+        """Data augmentation via input noise on existing examples."""
         original = list(self.examples)
         for ex in original:
             for _ in range(n_per_variant):
@@ -626,11 +773,10 @@ class TrainingConfig:
     """Configuration for the training pipeline."""
     # Pre-training
     pretrain_epochs: int = 10
-    pretrain_samples: int = 100_000
     pretrain_batch_size: int = 16
     pretrain_lr: float = 1e-4
 
-    # GENCODE paths (optional — uses synthetic if not set)
+    # GENCODE paths (required for pre-training)
     gencode_gtf_path: Optional[str] = None
     gencode_fasta_path: Optional[str] = None
     gencode_max_examples: int = 100000
@@ -953,15 +1099,15 @@ class SpliceTrainer:
     def pretrain(self) -> dict[str, list[float]]:
         """Stage 1: Pre-train on paired splice junctions.
         
-        Uses GENCODE real splice junctions (252K+ real exon-intron-exon
-        triplets from GRCh38). Each real junction is converted to a
-        paired (WT, MUT) example by simulating a variant.
+        Uses GENCODE v44 splice junctions (252K+ exon-intron-exon
+        triplets from GRCh38). Each junction is converted to a
+        paired (WT, MUT) example by introducing a variant.
         
         Requires GENCODE GTF + FASTA files in data/external/.
         """
         if not self.config.use_gencode:
             raise RuntimeError(
-                "Pre-training requires real GENCODE data. "
+                "Pre-training requires GENCODE data. "
                 "Ensure gencode_gtf_path and gencode_fasta_path are set in config.yaml "
                 "and the files exist at:\n"
                 f"  GTF:   {self.config.gencode_gtf_path}\n"
@@ -975,13 +1121,12 @@ class SpliceTrainer:
         print(f"  Max examples: {self.config.gencode_max_examples:,}")
         print("=" * 70)
 
-        # Use gencode_max_examples when GENCODE is available, otherwise pretrain_samples
-        n_samples = (self.config.gencode_max_examples
-                     if self.config.use_gencode
-                     else self.config.pretrain_samples)
-
         dataset = PairedSpliceDataset(
-            n_samples=n_samples,
+            gtf_path=self.config.gencode_gtf_path,
+            fasta_path=self.config.gencode_fasta_path,
+            max_examples=self.config.gencode_max_examples,
+            max_intron_len=self.config.gencode_max_intron_len,
+            min_exon_len=self.config.gencode_min_exon_len,
             ctx_len=self.model.config.max_seq_len,
             target_len=self.model.config.max_seq_len,
             seed=self.config.seed,

@@ -61,16 +61,15 @@ model:
 # ── Pre-training ───────────────────────────────────────────────────
 # Stage 1: Model learns normal splicing rules (GT/AG recognition,
 # intron removal, ESE motif effects) from splice junction data.
-# Uses GENCODE real junctions when paths are set, otherwise synthetic data.
+# Requires GENCODE GTF + GRCh38 FASTA.
 pretraining:
   epochs: 15                # Number of pre-training epochs (balanced speed vs convergence)
-  samples: 250000           # Number of synthetic splice junction examples (fallback)
   batch_size: 16            # Batch size for pre-training (32 causes OOM on MPS 18GB)
   learning_rate: 1.0e-4     # AdamW learning rate
 
-  # GENCODE data (optional — real splice junctions, far superior to synthetic)
+  # GENCODE data (required for pre-training)
   # Download from: https://www.gencodegenes.org/human/
-  # Set both paths to enable; leave null to use synthetic data.
+  # Both paths must be set and files must exist.
   gencode_gtf_path: "data/external/gencode.v44.annotation.gtf"
   gencode_fasta_path: "data/external/GRCh38.primary_assembly.genome.fa"
   gencode_max_examples: 252835   # extract ALL valid splice junctions from GENCODE
@@ -127,7 +126,7 @@ gnomad:
 
 # ── Splice Motifs (Biological Definitions) ─────────────────────────
 # ESE/ESS hexamers used in:
-#   1. Pre-training: embedded in synthetic exons to teach ESE recognition
+#   1. Pre-training: mutation labels (disruption of ESE in GENCODE exons)
 #   2. Evaluation: ESE disruption scoring for exonic variants
 #
 # Sources:
