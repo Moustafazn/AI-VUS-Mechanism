@@ -7,14 +7,17 @@ Generates supplementary tables from experiments/results/*.json
 Outputs: CSV files + LaTeX tables for the manuscript
 
 Tables produced:
-  Table S1: Baseline tool performance (17 tools × 7 metrics)
+  Table S1: Baseline tool and ensemble performance
   Table S2: LOO cross-validation per-variant results
-  Table S3: Ablation study results (6 ablations)
+  Table S3: Component ablation results
+  Table S3b: BRCA1 domain-specific fine-tuning
   Table S4: SOTA benchmark comparison (literature 2019-2026)
   Table S5: SpliceAI head-to-head evaluation
   Table S6: Model architecture & hyperparameters
   Table S7: Dataset summary (primary + external)
   Table S8: Calibration metrics
+  Table S9: Cross-dataset generalization
+  Table S11: Unified SOTA benchmark
 
 Usage:
     python scripts/generate_tables.py
@@ -24,12 +27,33 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime
+import sys
+from dataclasses import fields
 from pathlib import Path
-from typing import Any
+
+import yaml
 
 RESULTS_DIR = Path("experiments/results")
 TABLES_DIR = Path("paper/supplementary_tables")
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+sys.path.insert(0, str(CONFIG_PATH.parent))
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def count_model_parameters(cfg: dict) -> int:
+    """Count the configured architecture without loading a checkpoint or training."""
+    from src.diffusion.model import BiologicalDiffusionModel, DiffusionConfig
+
+    config_fields = {field.name for field in fields(DiffusionConfig)}
+    model_config = DiffusionConfig(**{
+        key: value for key, value in cfg["model"].items() if key in config_fields
+    })
+    model = BiologicalDiffusionModel(model_config)
+    return sum(parameter.numel() for parameter in model.parameters())
 
 
 def load_json(filename: str) -> dict | None:
@@ -180,6 +204,8 @@ def table_s3_ablation():
         return
 
     baseline = data.get("baseline_auroc")
+    loo = load_json("loo_cv.json") or {}
+    baseline_ba = loo.get("eval_at_optimal", {}).get("balanced_accuracy")
 
     headers = ["#", "Ablation", "Component Removed",
                "AUROC", "BalAcc", "Δ AUROC", "Status"]
@@ -189,7 +215,7 @@ def table_s3_ablation():
     if baseline is not None:
         rows.append([
             "—", "Full model (baseline)", "None (all components)",
-            fmt(baseline), "0.938", "—", "baseline",
+            fmt(baseline), fmt(baseline_ba), "—", "baseline",
         ])
 
     for a in data["ablations"]:
@@ -211,7 +237,7 @@ def table_s3_ablation():
     if baseline is not None:
         latex_rows.append([
             "Full model (baseline)",
-            fmt(baseline), "0.938", "---",
+            fmt(baseline), fmt(baseline_ba), "---",
         ])
     for a in data["ablations"]:
         delta = a.get("delta_auroc")
@@ -221,8 +247,11 @@ def table_s3_ablation():
             fmt(a.get("ablated_balanced_accuracy")),
             f"{delta:+.3f}" if delta is not None else "---",
         ])
+    notes = [f"{a['name']}: {a['details']['note']}"
+             for a in data["ablations"] if a.get("details", {}).get("note")]
     write_latex("table_s3_ablation.tex", latex_headers, latex_rows,
-                caption="Ablation study results. Each row removes one component and evaluates via LOO-CV (N=31).",
+                caption="Ablation study results. Metrics and deltas as saved in the result JSON. "
+                        + " ".join(notes),
                 label="tab:ablation")
 
 
@@ -301,11 +330,14 @@ def table_s4_benchmark():
     # Add our method
     if data.get("our_method"):
         our = data["our_method"]
+        loo = load_json("loo_cv.json") or {}
         rows.append([
             "SpliceVarMech (Ours)", "2026", "D3PM + Bayesian Causal",
-            fmt(our.get("auroc") or our.get("balanced_accuracy")),
-            "Gold-standard NCSVs", "31+augmented",
-            "✓", "✓", "✓", "✓", "✓",
+            fmt(loo.get("auroc")),
+            "Gold-standard NCSVs (LOO-CV)", loo.get("n_total", "—"),
+            *["✓" if our.get(key) else "✗" for key in
+              ["predicts_mechanism", "generates_sequence", "provides_uncertainty",
+               "tissue_aware", "explains_prediction"]],
         ])
 
     write_csv("table_s4_benchmark.csv", headers, rows)
@@ -359,41 +391,47 @@ def table_s5_spliceai():
 # ──────────────────────────────────────────────────────────────────────
 
 def table_s6_architecture():
-    """Static table — model architecture details from config."""
+    """Model architecture and training settings from config.yaml."""
+    cfg = load_config()
+    model, pre, ft = cfg["model"], cfg["pretraining"], cfg["finetuning"]
+    training, mcmc = cfg["training"], cfg["mcmc"]
+    n_parameters = count_model_parameters(cfg)
     headers = ["Parameter", "Value"]
     rows = [
         ["Model", "BiologicalDiffusionModel (dual-stream, contrastive)"],
-        ["d\\_model", "256"],
-        ["Encoder layers", "6"],
-        ["Decoder layers", "6"],
-        ["Attention heads", "8"],
-        ["d\\_ff", "1024"],
+        ["d\\_model", model["d_model"]],
+        ["Encoder layers", model["n_encoder_layers"]],
+        ["Decoder layers", model["n_decoder_layers"]],
+        ["Attention heads", model["n_heads"]],
+        ["d\\_ff", model["d_ff"]],
         ["Normalization", "Pre-LayerNorm"],
-        ["Total parameters", "~9.2M"],
+        ["Total parameters", f"{n_parameters:,} (~{n_parameters / 1e6:.1f}M)"],
         ["", ""],
-        ["Diffusion timesteps", "100"],
-        ["Noise schedule", "Cosine"],
+        ["Diffusion timesteps", model["n_timesteps"]],
+        ["Noise schedule", model["noise_schedule"]],
         ["Self-conditioning", "Yes (Sahoo et al. 2024)"],
-        ["Contrastive weight", "0.1"],
-        ["Contrastive margin", "1.0"],
+        ["Contrastive weight", model["contrastive_weight"]],
+        ["Contrastive margin", model["contrastive_margin"]],
         ["", ""],
-        ["Pre-training data", "GENCODE v44 (100K splice junctions)"],
-        ["Pre-training epochs", "10"],
+        ["Pre-training data", f"GENCODE ({pre['gencode_max_examples']:,} junctions; configured maximum)"],
+        ["Pre-training epochs", pre["epochs"]],
         ["Fine-tuning data", "Gold-standard + Study 6 + augmentation"],
-        ["Fine-tuning epochs", "20"],
-        ["Learning rate", "1e-4 (warmup 100 steps → cosine)"],
-        ["Batch size", "32"],
-        ["EMA decay", "0.9999"],
-        ["Validation split", "15%"],
-        ["Early stopping", "Patience=10"],
+        ["Fine-tuning epochs", ft["epochs"]],
+        ["Learning rate", f"{pre['learning_rate']:g} (pretrain) / {ft['learning_rate']:g} (finetune)"],
+        ["Warmup steps", training["warmup_steps"]],
+        ["Batch size", f"{pre['batch_size']} (pretrain) / {ft['batch_size']} (finetune)"],
+        ["EMA decay", training["ema_decay"]],
+        ["Validation split", f"{training['val_split']:.0%}"],
+        ["Early stopping", f"Patience={training['early_stopping_patience']}"],
         ["", ""],
         ["Bayesian model", "PyMC 5.x, MCMC (NUTS)"],
-        ["MCMC samples", "2000 (2 chains)"],
-        ["MCMC tune", "1000"],
-        ["Prior", "Hierarchical shrinkage (regularized horseshoe)"],
+        ["MCMC samples", f"{mcmc['n_samples']} per chain ({mcmc['n_chains']} chains)"],
+        ["MCMC tune", mcmc["n_tune"]],
+        ["Target acceptance", mcmc["target_accept"]],
+        ["Prior", "Hierarchical shrinkage"],
         ["Class weights", "Balanced (auto)"],
         ["", ""],
-        ["Device", "Auto (CUDA → MPS → CPU)"],
+        ["Device", cfg.get("device") or "Auto (CUDA → MPS → CPU)"],
         ["Framework", "PyTorch 2.x + PyMC 5.x"],
     ]
 
@@ -407,6 +445,7 @@ def table_s6_architecture():
 
 def table_s7_datasets():
     """Static table — dataset summary."""
+    cfg = load_config()
     headers = ["Dataset", "Source", "N Variants", "Role", "Reference"]
 
     rows = [
@@ -421,9 +460,9 @@ def table_s7_datasets():
         ["Study 4", "Literature", "326", "Evaluation",
          "TESE outcomes (n=571)"],
         ["", "", "", "", ""],
-        ["GENCODE v44", "EBI/GENCODE", "252K junctions", "Pre-training (Stage 1)",
+        ["GENCODE v44", "EBI/GENCODE", cfg["pretraining"]["gencode_max_examples"], "Pre-training (configured maximum)",
          "GENCODE Consortium"],
-        ["gnomAD v4.1", "Broad Institute", "~1,000+ benign", "Training augmentation",
+        ["gnomAD v4.1", "Broad Institute", cfg["gnomad"]["max_negatives"], "Training augmentation (configured maximum)",
          "Karczewski et al. Nature 2020"],
         ["ClinVar", "NCBI", "394,686", "Training augmentation",
          "Landrum et al. NAR 2020"],
@@ -528,53 +567,6 @@ def table_s9_generalization():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# TABLE S10: Pre-train Only vs Fine-tuned (Ablation 8)
-# ──────────────────────────────────────────────────────────────────────
-
-def table_s10_pretrain_vs_finetune():
-    data = load_json("ablation_pretrain_vs_finetune.json")
-    if not data:
-        return
-
-    # Overall comparison
-    headers = ["Metric", "Pre-train Only", "Fine-tuned", "Δ"]
-    rows = []
-    pt = data.get("pretrain_only", {})
-    ft = data.get("finetuned", {})
-    for metric in ["balanced_accuracy", "sensitivity", "specificity"]:
-        pt_v = pt.get(metric)
-        ft_v = ft.get(metric)
-        delta = (ft_v - pt_v) if pt_v is not None and ft_v is not None else None
-        rows.append([
-            metric.replace("_", " ").title(),
-            fmt(pt_v), fmt(ft_v),
-            f"{delta:+.4f}" if delta is not None else "—",
-        ])
-
-    write_csv("table_s10a_pretrain_vs_finetune_overall.csv", headers, rows)
-
-    # Per-variant-type breakdown
-    if data.get("per_variant_type"):
-        pvt_headers = ["Variant Type", "N", "N Pos", "N Neg",
-                       "PT Bal. Acc", "FT Bal. Acc", "Δ BA"]
-        pvt_rows = []
-        for vtype, info in sorted(data["per_variant_type"].items()):
-            pt_ba = info.get("pt_balanced_accuracy")
-            ft_ba = info.get("ft_balanced_accuracy")
-            delta = (ft_ba - pt_ba) if pt_ba is not None and ft_ba is not None else None
-            pvt_rows.append([
-                vtype,
-                info.get("n", "—"),
-                info.get("n_positive", "—"),
-                info.get("n_negative", "—"),
-                fmt(pt_ba),
-                fmt(ft_ba),
-                f"{delta:+.4f}" if delta is not None else "—",
-            ])
-        write_csv("table_s10b_pretrain_vs_finetune_per_type.csv", pvt_headers, pvt_rows)
-
-
-# ──────────────────────────────────────────────────────────────────────
 # TABLE S11: Unified SOTA Benchmark
 # ──────────────────────────────────────────────────────────────────────
 
@@ -604,15 +596,19 @@ def table_s11_sota_benchmark():
 
     # Summary
     if data.get("summary"):
-        sum_headers = ["Tool", "Avg AUROC", "Avg Balanced Acc", "Avg Coverage (%)", "N Datasets"]
+        sum_headers = ["Tool", "Avg AUROC", "Avg Balanced Acc", "Avg Coverage (%)",
+                       "N Datasets (total)", "N AUROC Datasets", "N Balanced Acc Datasets"]
         sum_rows = []
         for tool, info in sorted(data["summary"].items()):
+            records = [v.get(tool, {}) for v in data["per_dataset"].values()]
             sum_rows.append([
                 tool,
                 fmt(info.get("avg_auroc")),
                 fmt(info.get("avg_balanced_accuracy")),
                 fmt(info.get("avg_coverage"), 1),
                 info.get("n_datasets", "—"),
+                sum(v.get("auroc") is not None for v in records),
+                sum(v.get("balanced_accuracy") is not None for v in records),
             ])
         write_csv("table_s11b_sota_benchmark_summary.csv", sum_headers, sum_rows)
 
@@ -640,7 +636,6 @@ def main():
         ("Table S7: Dataset Summary", table_s7_datasets),
         ("Table S8: Calibration", table_s8_calibration),
         ("Table S9: Generalization Evaluation", table_s9_generalization),
-        ("Table S10: Pre-train vs Fine-tune", table_s10_pretrain_vs_finetune),
         ("Table S11: SOTA Benchmark", table_s11_sota_benchmark),
     ]
 
