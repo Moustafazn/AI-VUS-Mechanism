@@ -1,38 +1,43 @@
 # SpliceVarMech
 
-**A Causal Generative Tool for Mechanistic Interpretation of Non-Canonical Splicing Variants**
+**A causal generative framework for mechanistic interpretation of non-canonical splicing variants**
 
 ## Abstract
 
-Variants of uncertain significance (VUS) in splice-regulatory regions constitute a major bottleneck in clinical genetics. Existing tools predict splice disruption as a single score without explaining the underlying mechanism or quantifying confidence. Here we present SpliceVarMech, a computational tool that integrates discrete sequence diffusion (D3PM) with Bayesian causal inference to provide mechanistic interpretation of non-canonical splicing variants (NCSVs). A dual-stream encoder with cross-attention explicitly compares wild-type and mutant pre-mRNA contexts, while a structural causal model with full MCMC posterior inference yields calibrated disruption probabilities with 95% credible intervals. On experimentally validated NCSVs from male infertility genes, SpliceVarMech achieves an AUROC of 1.000 and balanced accuracy of 1.000 in leave-one-out cross-validation, substantially outperforming SpliceAI (AUROC 0.619) and 16 baseline tools. Ablation analysis confirms that all four components—pre-training, contrastive learning, diffusion features, and domain-specific fine-tuning—are individually necessary. Cross-domain fine-tuning on BRCA1 saturation genome editing variants, using the identical training procedure, achieves AUROC 0.840, demonstrating that the architecture captures transferable splicing grammar adaptable to new disease contexts. The tool maps predictions to ACMG evidence criteria, enabling principled VUS reclassification with quantified uncertainty.
+Non-canonical splicing variants are difficult to interpret because disruption scores do not explain splice outcomes or quantify uncertainty. SpliceVarMech combines discrete sequence diffusion with Bayesian causal inference to compare wild-type and mutant sequences, predict splice mechanisms, and estimate disruption probabilities with 95% credible intervals. Bayesian leave-one-out cross-validation on 31 experimentally validated variants yielded an area under the receiver operating characteristic curve of 1.000, compared with 0.619 for SpliceAI on 30 scored variants. Component ablations reduced discrimination, while a separate evaluation on 54 variants supported the contribution of fine-tuning. Domain-specific fine-tuning increased discrimination from 0.722 to 0.840 on 203 held-out BRCA1 variants. Calibration was assessed in-sample and requires held-out validation. These results support further evaluation of paired-sequence modeling and Bayesian inference for mechanistic variant interpretation.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)]()
 [![PyMC 5.x](https://img.shields.io/badge/PyMC-5.x-orange.svg)]()
 [![PyTorch 2.x](https://img.shields.io/badge/PyTorch-2.x-red.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)]()
 
-> **Paper:** Zein & Hassanien (2026). *SpliceVarMech: a causal generative tool for mechanistic interpretation of non-canonical splicing variants.*
+> **Paper:** Zein & Hassanien (2026). *SpliceVarMech: A causal generative framework for mechanistic interpretation of non-canonical splicing variants.*
+> **Submission preparation:** iScience, November 2026. See [submission notes](paper/SUBMISSION_NOTES.md).
 
 ---
 
 ## Key Features & Results
 
-SpliceVarMech is the first computational tool that combines **discrete sequence diffusion** (D3PM) with **Bayesian causal inference** to interpret non-canonical splicing variants (NCSVs). Unlike existing tools that output a single score, SpliceVarMech provides:
+SpliceVarMech is the first computational framework that combines **discrete sequence diffusion** (D3PM) with **Bayesian causal inference** to interpret non-canonical splicing variants (NCSVs). Unlike existing tools that output a single score, SpliceVarMech provides:
 
 1. **Mechanistic prediction** — predicts *what* happens to the mRNA (exon skipping, intron retention, cryptic site activation)
-2. **Calibrated uncertainty** — posterior probabilities with 95% credible intervals via full MCMC inference
+2. **Posterior uncertainty** — posterior probabilities with 95% credible intervals via full MCMC inference
 3. **Explainable reports** — maps predictions to ACMG evidence criteria for clinical VUS reclassification
 
 ### Key Results
 
-| Metric | SpliceVarMech | SpliceAI | Improvement |
+| Metric | SpliceVarMech | SpliceAI | Difference |
 |--------|:---:|:---:|:---:|
-| AUROC (LOO-CV, N=31) | **1.000** | 0.619 | +62% |
-| Balanced Accuracy | **1.000** | 0.705 | +42% |
-| Sensitivity | **1.000** | 0.409 | +144% |
-| Specificity | **1.000** | 1.000 | — |
-| MCC | **1.000** | — | — |
-| Coverage | **100%** | 96.8% | — |
+| AUROC | **1.000** | 0.619 | +0.381 |
+| Balanced Accuracy | **1.000** | 0.705 | +0.295 |
+| Sensitivity | **1.000** | 0.409 | +0.591 |
+| Specificity | **1.000** | 1.000 | +0.000 |
+| MCC | **1.000** | 0.395 | +0.605 |
+| Coverage | **100%** | 96.8% | +3.2 percentage points |
+
+SpliceVarMech uses Bayesian-stage LOO predictions for 31 variants (23 pathogenic, 8 benign); SpliceAI metrics use its 30 scored variants. Threshold-dependent metrics use each method's optimal threshold (0.410 and 0.866, respectively). Differences are absolute, calculated from unrounded JSON values; the scored subsets differ.
+
+Calibration is a separate **in-sample** evaluation on the 31 variants used to fit the Bayesian model: ECE **0.040**, MCE **0.040**, Brier score **0.002**, with 2 nonempty bins out of 10. These are not held-out LOO calibration estimates. All **31/31 LOO folds completed**; saved completion flags do not establish fold-wise R-hat or effective sample size diagnostics.
 
 ### Cross-Domain Generalization
 
@@ -40,8 +45,10 @@ The architecture is **domain-agnostic** — the same model and training procedur
 
 | Domain | Pre-trained AUROC | After Fine-tuning | Δ |
 |--------|:---:|:---:|:---:|
-| Male Infertility (primary) | 0.346 | **1.000** | +0.654 |
-| BRCA1 Breast Cancer (SGE) | 0.722 | **0.840** | +0.118 |
+| Male Infertility (full gold standard, N=54) | 0.346 | **0.600** | +0.254 |
+| BRCA1 Breast Cancer (held-out SGE test, N=203) | 0.722 | **0.840** | +0.118 |
+
+Each row compares the same evaluation cohort before and after fine-tuning. The full 54-variant diffusion-model evaluation is separate from the Bayesian-stage LOO AUROC of 1.000 on 31 variants and is not an independent test set.
 
 ---
 
@@ -89,7 +96,7 @@ samtools faidx data/external/GRCh38.primary_assembly.genome.fa
 
 The gold-standard dataset from:
 
-> Li K, Chen Y, Tang D, et al. *Mapping the Non-Canonical Splicing Variants: Decrypting the Hidden Genetic Architecture of Idiopathic Male Infertility.* Advanced Science. 2026. DOI: [10.1002/advs.202315512](https://doi.org/10.1002/advs.202315512)
+> Li K, Chen Y, Tang D, et al. *Mapping the Non-Canonical Splicing Variants: Decrypting the Hidden Genetic Architecture of Idiopathic Male Infertility.* Advanced Science. 2026. DOI: [10.1002/advs.202515512](https://doi.org/10.1002/advs.202515512)
 
 ```bash
 # Download the supplementary Excel file and place in data/raw/
@@ -156,7 +163,7 @@ python scripts/generate_tables.py    # All supplementary tables (CSV + LaTeX)
 │  • Dual-stream encoder (WT vs MUT cross-attention)       │
 │  • Contrastive learning (WT/MUT separation)              │
 │  • D3PM reverse sampling → mechanism classification      │
-│  • ~9.2M parameters                                      │
+│  • 12,105,483 parameters (~12.1M)                        │
 ├─────────────────────────────────────────────────────────┤
 │  MODULE 2: Bayesian Causal Inference (PyMC + NUTS)       │
 │  • Structural causal model (V→S, V→E, V→I pathways)     │
@@ -173,8 +180,10 @@ python scripts/generate_tables.py    # All supplementary tables (CSV + LaTeX)
 
 ### Two-Stage Training
 
-1. **Stage 1 (Pre-training):** Learn splicing grammar from 252,835 GENCODE v44 splice junctions
-2. **Stage 2 (Fine-tuning):** Adapt to variant effects using gold-standard NCSVs + augmentation data
+1. **Stage 1 (Pre-training):** Learn splicing grammar from GENCODE v44 splice junctions, with a configured extraction limit of 252,835 junctions
+2. **Stage 2 (Fine-tuning):** Adapt using gold-standard variants with available contexts, MFASS (up to 200 variants per class), and gnomAD (up to 500 benign candidates with usable contexts)
+
+The loader adds 15 noisy-context copies per admitted training example while retaining the original. Final training-set sizes are not recorded in the saved histories. Architecture and training settings come from `config.yaml`; the parameter count is calculated from the configured model.
 
 ---
 
@@ -219,8 +228,8 @@ alt_t = torch.tensor([VOCAB[ctx.mut_pre_mrna[var_pos]]], device=device)
 with torch.no_grad():
     result = model.compute_contrastive_distance(wt_tok, mut_tok, vpos, ref_t, alt_t)
     print(f"Contrastive distance: {result['contrastive_distance']:.4f}")
-    # High distance (>0.1) = likely disruptive
-    # Low distance (<0.05) = likely benign
+    # Contrastive distance is an input feature for the Bayesian model.
+    # It is not a calibrated disruption probability or a validated decision cutoff.
 ```
 
 ---
@@ -341,12 +350,15 @@ print(report)
 
 ### Interpreting results
 
-| Posterior P(disruption) | ACMG Evidence | Clinical Action |
-|:---:|:---:|---|
-| > 0.85 | PP3_Strong | Likely Pathogenic — report to clinician |
-| 0.50–0.85 | PP3_Moderate | VUS — additional evidence recommended |
-| < 0.30 | BP4_Supporting | Likely Benign — low priority |
-| CI width > 0.30 | Insufficient | Inconclusive — more data needed |
+The current `determine_acmg_criteria` function uses these posterior thresholds to assign report labels:
+
+| Posterior P(disruption) | Implemented report label |
+|:---:|---|
+| > 0.70 | PP3_Strong |
+| > 0.50 and ≤ 0.70 | PP3_Moderate |
+| ≤ 0.50 | No PP3 label from this rule |
+
+These are implementation rules, not validated clinical decision thresholds. The current function does not assign BP4 from a low posterior. Its TEX11 example also assumes population absence and phenotype consistency; these are not inferred from the posterior. The separate High/Moderate/Low confidence grade combines posterior probability, credible-interval width, sample count and tool agreement; neither a posterior threshold nor interval width alone defines that grade.
 
 ---
 
@@ -398,15 +410,18 @@ AI-VUS-Mechanism/
 
 ## Ablation Study Results
 
-All four components are individually necessary:
+The first four rows use Bayesian-stage LOO-CV on 31 variants. The final two rows compare diffusion models on the full 54-variant gold standard. ΔAUROC uses the baseline within the same evaluation group.
 
 | Configuration | AUROC | Balanced Acc. | ΔAUROC |
 |---|:---:|:---:|:---:|
-| Full model (baseline) | **1.000** | **1.000** | — |
+| Full model (LOO baseline, N=31) | **1.000** | **1.000** | — |
 | − Pre-training | 0.255 | 0.500 | −0.745 |
-| − Contrastive loss | 0.342 | 0.500 | −0.658 |
+| − Contrastive loss | 0.342 | 0.508 | −0.658 |
 | − Diffusion features | 0.277 | 0.500 | −0.723 |
-| − Fine-tuning | 0.346 | 0.525 | −0.654 |
+| Fine-tuned model (full-set baseline, N=54) | **0.600** | **0.679** | — |
+| − Fine-tuning (N=54) | 0.346 | 0.525 | −0.254 |
+
+The largest recorded LOO AUROC decrease is 0.745 without pre-training. Results above are drawn from `experiments/results/loo_cv.json`, `spliceai_evaluation.json`, `calibration.json`, `ablation_results.json`, `generalization_evaluation.json` and `brca1_domain_finetune.json`; the fine-tuning delta uses the matched 54-variant comparator recorded in the JSON details.
 
 ---
 
@@ -414,7 +429,7 @@ All four components are individually necessary:
 
 ```bibtex
 @article{zein2026splicevarmech,
-  title={SpliceVarMech: a causal generative tool for mechanistic interpretation 
+  title={SpliceVarMech: A causal generative framework for mechanistic interpretation
          of non-canonical splicing variants},
   author={Zein, Moustafa and Hassanien, Aboul Ella},
   year={2026}

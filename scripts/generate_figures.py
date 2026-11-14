@@ -3,12 +3,12 @@
 SpliceVarMech — Publication Figure Generator
 SpliceVarMech — Publication Figure Generator
 
-Article format:
-  - Max 7 display items (figures or tables) in main text
-  - Main text <= 7,000 words (incl. figure legends, excl. STAR Methods)
-  - 300 DPI, single column (85mm) or double column (178mm)
+iScience research-article preparation (guide checked November 2026):
+  - The journal advises article length below 8,000 words.
+  - Export separate vector PDF figure files; raster output uses 300 DPI.
+  - Figure legends and submission packaging are maintained in paper/.
 
-Main Figures (5 figures + 2 tables = 7 display items):
+Main Figures (5 figures; the manuscript also contains 4 main tables):
   Figure 1: Framework architecture (professional schematic)
   Figure 2: LOO-CV + SpliceAI head-to-head
   Figure 3: 16-tool baseline comparison
@@ -537,7 +537,8 @@ def figure4_training_calibration():
             ax1.plot(np.linspace(0, n-1, len(vl)), vl, color=C["amber"], ls="--", lw=1, label="Val loss")
         ax1.legend(frameon=False, fontsize=5)
     ax1.set_xlabel("Step"); ax1.set_ylabel("Loss")
-    ax1.set_title(f"Pre-training (GENCODE, {cfg['pretraining']['gencode_max_examples']:,})", fontsize=7)
+    ax1.xaxis.set_major_formatter(lambda value, _: f"{value / 1000:g}k" if value else "0")
+    ax1.set_title(f"Pre-training (limit {cfg['pretraining']['gencode_max_examples']:,})", fontsize=7)
 
     # B: Fine-tuning
     ax2 = fig.add_subplot(gs[1])
@@ -581,7 +582,7 @@ def figure4_training_calibration():
                  bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.5))
     ax3.set_xlabel("Predicted Probability"); ax3.set_ylabel("Observed Frequency")
     ax3.set_xlim(-0.02, 1.02); ax3.set_ylim(-0.02, 1.02)
-    ax3.set_title("Calibration", fontsize=7)
+    ax3.set_title("In-sample calibration", fontsize=7)
 
     save_fig(fig, "figure4_training_calibration")
     plt.close(fig)

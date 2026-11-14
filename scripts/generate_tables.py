@@ -164,7 +164,7 @@ def table_s2_loo_cv():
     summary_rows = [
         ["AUROC", fmt(data.get("auroc"))],
         ["AUPRC", fmt(data.get("auprc"))],
-        ["N Converged", f"{data.get('n_converged', '?')}/{data.get('n_total', '?')}"],
+        ["Completed folds", f"{data.get('n_converged', '?')}/{data.get('n_total', '?')}"],
         ["Optimal Threshold", fmt(data.get("optimal_threshold"))],
     ]
 
@@ -203,55 +203,63 @@ def table_s3_ablation():
     if not data or not data.get("ablations"):
         return
 
-    baseline = data.get("baseline_auroc")
     loo = load_json("loo_cv.json") or {}
+    baseline = loo.get("auroc", data.get("baseline_auroc"))
     baseline_ba = loo.get("eval_at_optimal", {}).get("balanced_accuracy")
+    loo_group = f"LOO-CV (N={loo.get('n_total', 'N/A')})"
+    gen = load_json("generalization_evaluation.json") or {}
+    full = gen.get("datasets", {}).get("finetune_gold_standard", {})
+    full_group = f"Full gold standard (N={full.get('n_variants', 'N/A')})"
 
-    headers = ["#", "Ablation", "Component Removed",
-               "AUROC", "BalAcc", "Δ AUROC", "Status"]
-    rows = []
-
-    # Add baseline row
+    headers = ["#", "Ablation", "Component Removed", "AUROC", "BalAcc",
+               "Δ AUROC", "Status", "Reference AUROC", "Evaluation"]
+    rows, latex_rows = [], []
     if baseline is not None:
-        rows.append([
-            "—", "Full model (baseline)", "None (all components)",
-            fmt(baseline), fmt(baseline_ba), "—", "baseline",
-        ])
+        rows.append(["—", "Full model (LOO baseline)", "None (all components)",
+                     fmt(baseline), fmt(baseline_ba), "—", "baseline",
+                     fmt(baseline), loo_group])
+        latex_rows.append(["Full model (LOO baseline)", fmt(baseline),
+                           fmt(baseline_ba), "---"])
 
     for a in data["ablations"]:
-        rows.append([
-            a.get("id", "—"),
-            a.get("name", "—"),
-            a.get("what_is_removed", "—"),
-            fmt(a.get("ablated_auroc")),
-            fmt(a.get("ablated_balanced_accuracy")),
-            fmt(a.get("delta_auroc"), 3) if a.get("delta_auroc") is not None else "—",
-            a.get("status", "—"),
-        ])
+        details = a.get("details", {})
+        # The no-fine-tuning run uses the full gold standard. Its matched
+        # fine-tuned comparator is recorded inside details, whereas the
+        # top-level delta incorrectly subtracts the LOO baseline.
+        matched = details.get("finetune_auroc")
+        reference = matched if matched is not None else baseline
+        evaluation = full_group if matched is not None else loo_group
+        if matched is not None:
+            matched_ba = details.get("finetune_ba")
+            rows.append(["—", "Fine-tuned model (full-set baseline)", "None",
+                         fmt(matched), fmt(matched_ba), "—", "baseline",
+                         fmt(matched), evaluation])
+            latex_rows.append(["Fine-tuned model (full-set baseline)",
+                               fmt(matched), fmt(matched_ba), "---"])
+        auroc = a.get("ablated_auroc")
+        delta = auroc - reference if auroc is not None and reference is not None else None
+        rows.append([a.get("id", "—"), a.get("name", "—"),
+                     a.get("what_is_removed", "—"), fmt(auroc),
+                     fmt(a.get("ablated_balanced_accuracy")), fmt(delta),
+                     a.get("status", "—"), fmt(reference), evaluation])
+        latex_rows.append([a.get("name", ""), fmt(auroc),
+                           fmt(a.get("ablated_balanced_accuracy")),
+                           f"{delta:+.3f}" if delta is not None else "---"])
 
     write_csv("table_s3_ablation.csv", headers, rows)
-
-    # Also generate LaTeX version
-    latex_headers = ["Configuration", "AUROC", "Balanced Accuracy", "$\\Delta$ AUROC"]
-    latex_rows = []
-    if baseline is not None:
-        latex_rows.append([
-            "Full model (baseline)",
-            fmt(baseline), fmt(baseline_ba), "---",
-        ])
-    for a in data["ablations"]:
-        delta = a.get("delta_auroc")
-        latex_rows.append([
-            f"$-$ {a.get('name', '')}",
-            fmt(a.get("ablated_auroc")),
-            fmt(a.get("ablated_balanced_accuracy")),
-            f"{delta:+.3f}" if delta is not None else "---",
-        ])
-    notes = [f"{a['name']}: {a['details']['note']}"
-             for a in data["ablations"] if a.get("details", {}).get("note")]
-    write_latex("table_s3_ablation.tex", latex_headers, latex_rows,
-                caption="Ablation study results. Metrics and deltas as saved in the result JSON. "
-                        + " ".join(notes),
+    write_latex("table_s3_ablation.tex",
+                ["Configuration", "AUROC", "Balanced Accuracy", "$\\Delta$ AUROC"],
+                latex_rows,
+                caption=(r"\textbf{Component ablation results.} "
+                         r"\par Pre-training, contrastive-loss and diffusion-feature "
+                         "ablations use Bayesian-stage LOO-CV on "
+                         f"{loo.get('n_total', 'N/A')} variants. The fine-tuning "
+                         "comparison uses diffusion-model evaluations on the full "
+                         f"{full.get('n_variants', 'N/A')}-variant gold standard. "
+                         r"$\Delta$AUROC is calculated relative to the matched "
+                         "baseline within each evaluation group. AUROC denotes the area "
+                         "under the receiver operating characteristic curve; balanced "
+                         "accuracy is the mean of sensitivity and specificity."),
                 label="tab:ablation")
 
 
@@ -291,11 +299,24 @@ def table_s3b_brca1_finetune():
             fmt(b), fmt(a),
             f"{d:+.3f}" if d is not None else "---",
         ])
+    test_neg = (data["test_size"] - data["test_pos"]
+                if data.get("test_size") is not None and data.get("test_pos") is not None
+                else "N/A")
+    train_neg = (data["train_size"] - data["train_pos"]
+                 if data.get("train_size") is not None and data.get("train_pos") is not None
+                 else "N/A")
     write_latex("table_s3b_brca1_finetune.tex", latex_headers, latex_rows,
-                caption=f"BRCA1 domain-specific fine-tuning results. "
-                        f"Train: {data.get('train_size', '?')} variants (balanced), "
-                        f"Test: {data.get('test_size', '?')} variants. "
-                        f"Identical training procedure as male infertility fine-tuning.",
+                caption=(r"\textbf{BRCA1 domain-specific fine-tuning.} "
+                         r"\par Metrics before and after fine-tuning are evaluated "
+                         f"on the same held-out test set of {data.get('test_size', 'N/A')} "
+                         f"variants, comprising {data.get('test_pos', 'N/A')} "
+                         f"loss-of-function (LOF) and {test_neg} functional (FUNC) "
+                         "variants. After LOF oversampling, the training set contains "
+                         f"{data.get('train_size', 'N/A')} examples, comprising "
+                         f"{data.get('train_pos', 'N/A')} LOF and {train_neg} FUNC "
+                         r"examples. $\Delta$ denotes the change after fine-tuning. "
+                         "AUROC denotes the area under the receiver operating "
+                         "characteristic curve."),
                 label="tab:brca1_finetune")
 
 
@@ -415,7 +436,7 @@ def table_s6_architecture():
         ["", ""],
         ["Pre-training data", f"GENCODE ({pre['gencode_max_examples']:,} junctions; configured maximum)"],
         ["Pre-training epochs", pre["epochs"]],
-        ["Fine-tuning data", "Gold-standard + Study 6 + augmentation"],
+        ["Fine-tuning data", "Gold-standard + MFASS/gnomAD candidates"],
         ["Fine-tuning epochs", ft["epochs"]],
         ["Learning rate", f"{pre['learning_rate']:g} (pretrain) / {ft['learning_rate']:g} (finetune)"],
         ["Warmup steps", training["warmup_steps"]],
@@ -446,16 +467,16 @@ def table_s6_architecture():
 def table_s7_datasets():
     """Static table — dataset summary."""
     cfg = load_config()
-    headers = ["Dataset", "Source", "N Variants", "Role", "Reference"]
+    headers = ["Dataset", "Source", "Source size / limit", "Role", "Reference"]
 
     rows = [
-        ["Table S1 (primary)", "Advanced Science 2024", "2,404", "Feature matrix",
-         "Mapping NCSVs, Adv. Sci. 2024"],
-        ["Table S2 (negatives)", "Advanced Science 2024", "14", "Gold-standard negatives",
-         "Mapping NCSVs, Adv. Sci. 2024"],
-        ["Table S7 (NCSVs)", "Advanced Science 2024", "40", "Gold-standard positives",
-         "Mapping NCSVs, Adv. Sci. 2024"],
-        ["Study 6", "Literature", "341", "Training augmentation",
+        ["Table S1 (primary)", "Advanced Science 2026", "2,404", "Feature matrix",
+         "Mapping NCSVs, Adv. Sci. 2026"],
+        ["Table S2 (negatives)", "Advanced Science 2026", "14", "Gold-standard negatives",
+         "Mapping NCSVs, Adv. Sci. 2026"],
+        ["Table S7 (NCSVs)", "Advanced Science 2026", "40", "Gold-standard positives",
+         "Mapping NCSVs, Adv. Sci. 2026"],
+        ["Study 6", "Literature", "341", "Available reference dataset",
          "Splice defects in infertility"],
         ["Study 4", "Literature", "326", "Evaluation",
          "TESE outcomes (n=571)"],
@@ -464,10 +485,10 @@ def table_s7_datasets():
          "GENCODE Consortium"],
         ["gnomAD v4.1", "Broad Institute", cfg["gnomad"]["max_negatives"], "Training augmentation (configured maximum)",
          "Karczewski et al. Nature 2020"],
-        ["ClinVar", "NCBI", "394,686", "Training augmentation",
+        ["ClinVar", "NCBI", "394,686", "Bayesian augmentation source",
          "Landrum et al. NAR 2020"],
         ["", "", "", "", ""],
-        ["MFASS", "Cheung et al. 2019", "27,733", "Cross-dataset eval",
+        ["MFASS", "Cheung et al. 2019", "27,733", "Training source (up to 200 per class)",
          "Cheung et al. Mol Cell 2019"],
         ["BRCA1 SGE", "Findlay et al. 2018", "3,644", "Cross-dataset eval",
          "Findlay et al. Nature 2018"],
