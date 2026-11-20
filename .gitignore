@@ -2,9 +2,10 @@
 # SpliceVarMech — .gitignore
 # ──────────────────────────────────────────────────────────────
 
-# ── Data files (large, not for version control) ──
-# Only ignore top-level data/ folder (not src/data/ which is source code)
-/data/
+# ── Source data (download separately, not for version control) ──
+# Keep raw inputs and downloaded external datasets ignored.
+# Allow the small processed tables used to reproduce the analyses.
+/data/*
 *.xlsx
 *.csv
 *.tsv
@@ -20,6 +21,8 @@
 *.gtf.gz
 *.bam
 *.bed
+!/data/processed/
+!/data/processed/**
 
 # ── Notebooks (checkpoints, outputs) ──
 notebooks/.ipynb_checkpoints/
@@ -50,12 +53,9 @@ venv/
 env/
 .env
 
-# ── PyTorch / ML artifacts ──
-experiments/
-*.pt
-*.pth
-*.ckpt
-*.bin
+# ── Experiment artifacts ──
+# Model checkpoints and saved results are eligible for version control.
+# Keep transient training-service logs and caches ignored.
 wandb/
 runs/
 lightning_logs/

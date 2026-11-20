@@ -1,0 +1,41 @@
+gene_variant,gene,hgvs,variant_type,outcome,mechanism_category,sequence_length
+LHCGR:c.265A>T,LHCGR,c.265A>T,Mis,Exon 3 skipping,exon_skipping,2100
+MAP3K1: c.634-8T>A,MAP3K1,c.634-8T>A,Intron,Intron 2 6bp retention,intron_retention,4546
+HSD17B3:c.277G>A,HSD17B3,c.277G>A,Mis,Exon 3 skipping,exon_skipping,933
+AR: c.1769-13T>G,AR,c.1769-13T>G,Intron,Intron 2 69bp retention,intron_retention,2832
+AR:c. 2053G>A,AR,c. 2053G>A,Mis,Exon 4 123bp deletion,partial_deletion,0
+MSH4:c.244G>A,MSH4,c.244G>A,Mis,Exon 1 skipping,exon_skipping,2811
+HENMT1:c.226G>A,HENMT1,c.226G>A,Mis,Exon 4 skipping,exon_skipping,1182
+DNAH1:c.8455G>A,DNAH1,c.8455G>A,Mis,Exon 53 skipping,exon_skipping,12798
+CCDC39:c.2431C>T,CCDC39,c.2431C>T,Mis,Exon 18 skipping,exon_skipping,2826
+SPINK2:c.206-3C>G,SPINK2,c.206-3C>G,Intron,Intron 2 2bp retention,intron_retention,407
+CFTR:c.743G>C,CFTR,c.743G>C,Mis,Exon 6 skipping,exon_skipping,4393
+CFTR:c.1115A>G,CFTR,c.1115A>G,Mis,Exon 8 skipping,exon_skipping,4443
+FSCN3 :c.1175G>A,FSCN3,c.1175G>A,Mis,Exon 5 68bp deletion,partial_deletion,1497
+NR5A1:c. 990G>A,NR5A1,c. 990G>A,Syn,Exon 5 skipping,exon_skipping,1386
+C14orf39:c.1180-3C>G,C14orf39,c.1180-3C>G,Intron,Exon 15 skipping,exon_skipping,1764
+TERB2:c.434G>A,TERB2,c.434G>A,Mis,Exon 5 skipping,exon_skipping,663
+MEIOB:c.191A>T,MEIOB,c.191A>T,Mis,Exon 4 69bp deletion,partial_deletion,1416
+CEP192:c.5750A>G,CEP192,c.5750A>G,Mis,Exon 31 133bp deletion,partial_deletion,7614
+TEX11:c.1483G>A,TEX11,c.1483G>A,Mis,Exon 17 skipping,exon_skipping,2823
+DNAH6:c.8726A>G,DNAH6,c.8726A>G,Mis,Exon 52 skipping,exon_skipping,12477
+DNAH1:c.10627-3C>G,DNAH1,c.10627-3C>G,Intron,Exon 67 skipping,exon_skipping,12798
+CFAP43:c.2141+5G>A,CFAP43,c.2141+5G>A,Intron,Intron 16 16bp retention,intron_retention,5014
+ENO4:c.293A>G,ENO4,c.293A>G,Mis,Exon 2 skipping,exon_skipping,1878
+TTC12:c.1470G>A,TTC12,c.1470G>A,Syn,Exon 16 skipping,exon_skipping,2043
+DPY19L2:c.2126+5G>A,DPY19L2,c.2126+5G>A,Intron,Exon 20 skipping,exon_skipping,2277
+DNAH10:c.12838G>A,DNAH10,c.12838G>A,Mis,Intron 74 retention and Exon 75 65bp deletion,complex,13310
+HYDIN:c.12441-3C>G,HYDIN,c.12441-3C>G,Intron,Exon 74 31bp deletion,partial_deletion,15366
+DNAH9:c.6956A>G,DNAH9,c.6956A>G,Mis,Exon 35 38bp deletion,partial_deletion,13461
+PAFAH1B1:c.400G>T,PAFAH1B1,c.400G>T,Mis,Exon 6 skipping,exon_skipping,1233
+TMF1:c.2859+4A>G,TMF1,c.2859+4A>G,Intron,Exon 14 skipping,exon_skipping,0
+TAF4B:c.489G>A,TAF4B,c.489G>A,Mis,Exon 2 skipping,exon_skipping,2604
+TAF9B:c.592G>C,TAF9B,c.592G>C,Mis,Exon 6 skipping,exon_skipping,756
+DNAH14:c.6452+5G>A,DNAH14,c.6452+5G>A,Intron,Exon 42 skipping,exon_skipping,13854
+DNAH1:c.4684A>G,DNAH1,c.4684A>G,Mis,Exon 28 skipping,exon_skipping,12798
+CFAP43:c.319+3A>C,CFAP43,c.319+3A>C,Intron,Exon 5 skipping,exon_skipping,4998
+DNAH1:c. 8811G>A,DNAH1,c. 8811G>A,Syn,Intron 55 retention,intron_retention,0
+DNAH10:c. 8113G>A,DNAH10,c. 8113G>A,Mis,Exon 49 skipping,exon_skipping,13416
+DNAH10:c.1436A>G,DNAH10,c.1436A>G,Mis,Intron 10 79bp retention,intron_retention,13494
+DNAH2:c.10670+5G>A,DNAH2,c.10670+5G>A,Intron,Exon 69 skipping,exon_skipping,13284
+IZUMO4:c.298G>C,IZUMO4,c.298G>C,Mis,Intron 2 retention,intron_retention,736
